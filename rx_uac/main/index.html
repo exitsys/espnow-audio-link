@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>ALINK 调参</title>
+<style>
+  :root{
+    --bg:#12141a; --card:#1b1e26; --line:#2a2f3a;
+    --txt:#e6e9ef; --dim:#8b93a3;
+    --ok:#3ecf8e; --warn:#e0a34a; --bad:#e05a5a; --acc:#5b8def;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;padding:14px;background:var(--bg);color:var(--txt);
+       font:15px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif}
+  h1{font-size:17px;margin:0 0 3px;font-weight:600}
+  .sub{color:var(--dim);font-size:12px;margin-bottom:14px;font-variant-numeric:tabular-nums}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+        padding:13px;margin-bottom:11px}
+  .card h2{font-size:12px;color:var(--dim);margin:0 0 11px;font-weight:500;
+           letter-spacing:.08em;text-transform:uppercase}
+  .hero{display:flex;gap:11px}
+  .big{flex:1;text-align:center;padding:9px 4px;background:#161922;border-radius:8px}
+  .big .v{font-size:27px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.15}
+  .big .k{font-size:11px;color:var(--dim);margin-top:2px}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-top:9px}
+  .cell{display:flex;justify-content:space-between;padding:7px 10px;
+        background:#161922;border-radius:6px;font-size:13px}
+  .cell .k{color:var(--dim)}
+  .cell .v{font-variant-numeric:tabular-nums;font-weight:500}
+  .ctl{margin-bottom:15px}
+  .ctl:last-child{margin-bottom:0}
+  .ctl .row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px}
+  .ctl label{font-size:13.5px}
+  .ctl .val{font-size:14px;font-weight:600;color:var(--acc);font-variant-numeric:tabular-nums}
+  .ctl .hint{font-size:11px;color:var(--dim);margin-top:3px;line-height:1.4}
+  input[type=range]{width:100%;height:30px;margin:0;background:transparent;
+                    -webkit-appearance:none;appearance:none;cursor:pointer}
+  input[type=range]::-webkit-slider-runnable-track{height:5px;border-radius:3px;
+                    background:linear-gradient(90deg,var(--acc) var(--p,50%),#2a2f3a var(--p,50%))}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;
+                    border-radius:50%;background:#fff;border:3px solid var(--acc);margin-top:-9px}
+  input[type=range]::-moz-range-track{height:5px;border-radius:3px;background:#2a2f3a}
+  input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
+                    background:#fff;border:3px solid var(--acc)}
+  .btns{display:flex;gap:8px;margin-top:14px}
+  button{flex:1;padding:11px;border-radius:8px;border:1px solid var(--line);
+         background:#222733;color:var(--txt);font-size:14px;font-weight:500;cursor:pointer}
+  button:active{transform:scale(.98)}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+  .badge{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;
+         margin-left:6px;vertical-align:middle}
+  .b-ok{background:rgba(62,207,142,.15);color:var(--ok)}
+  .b-warn{background:rgba(224,163,74,.15);color:var(--warn)}
+  .b-bad{background:rgba(224,90,90,.15);color:var(--bad)}
+  .foot{color:var(--dim);font-size:11px;text-align:center;margin-top:14px;line-height:1.6}
+</style>
+</head>
+<body>
+
+<h1>ALINK 接收端调参</h1>
+<div class="sub" id="sub">连接中…</div>
+
+<div class="card">
+  <h2>实时状态</h2>
+  <div class="hero">
+    <div class="big"><div class="v" id="v-q">–</div><div class="k">队列水位（包）</div></div>
+    <div class="big"><div class="v" id="v-ratio">–</div><div class="k">重采样比</div></div>
+    <div class="big"><div class="v" id="v-lat">–</div><div class="k">设备侧延时</div></div>
+  </div>
+  <div class="grid">
+    <div class="cell"><span class="k">包速率</span><span class="v" id="v-pkt">–</span></div>
+    <div class="cell"><span class="k">RSSI</span><span class="v" id="v-rssi">–</span></div>
+    <div class="cell"><span class="k">丢包</span><span class="v" id="v-lost">–</span></div>
+    <div class="cell"><span class="k">欠载</span><span class="v" id="v-under">–</span></div>
+    <div class="cell"><span class="k">补位</span><span class="v" id="v-pad">–</span></div>
+    <div class="cell"><span class="k">PLC</span><span class="v" id="v-plc">–</span></div>
+    <div class="cell"><span class="k">溢出</span><span class="v" id="v-over">–</span></div>
+    <div class="cell"><span class="k">相位钳</span><span class="v" id="v-clamp">–</span></div>
+    <div class="cell"><span class="k">跳变</span><span class="v" id="v-jump">–</span></div>
+    <div class="cell"><span class="k">零串</span><span class="v" id="v-zero">–</span></div>
+    <div class="cell"><span class="k">I2S 时钟</span><span class="v" id="v-rate">–</span></div>
+    <div class="cell"><span class="k">输出帧率</span><span class="v" id="v-out">–</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>参数</h2>
+
+  <div class="ctl">
+    <div class="row"><label>目标水位 TARGET_Q</label><span class="val"><span id="v-tq">18</span> 包</span></div>
+    <input type="range" id="s-tq" min="8" max="40" step="1" value="18">
+    <div class="hint">直接决定延时：1 包 = 5ms。改小省延时，低于 12 容易欠载。</div>
+  </div>
+
+  <div class="ctl">
+    <div class="row"><label>死区 DEADBAND</label><span class="val"><span id="v-db">3.0</span> 包</span></div>
+    <input type="range" id="s-db" min="0.5" max="8" step="0.1" value="3">
+    <div class="hint">死区内的偏差不重采样，ratio 恒 1.0 零插值。<b>3.0 是音质底线</b>，
+      收到 1.5 会让插值器全程在跑，小电平乐器发糊。</div>
+  </div>
+
+  <div class="ctl">
+    <div class="row"><label>P 增益 GAIN</label><span class="val"><span id="v-g">8</span></span></div>
+    <input type="range" id="s-g" min="2" max="32" step="1" value="8">
+    <div class="hint">收敛速度。8 稳但慢（29→18 要 50 秒），16 快但 ratio 一直在动，
+      超过 24 会在队列两端来回撞。</div>
+  </div>
+
+  <div class="ctl">
+    <div class="row"><label>重采样比上限</label><span class="val"><span id="v-lim">200</span> /65536</span></div>
+    <input type="range" id="s-lim" min="50" max="400" step="10" value="200">
+    <div class="hint">200 ≈ 0.3%。盒子的时钟失配 0.146% 需要至少 96，PC 只需 25。</div>
+  </div>
+
+  <div class="btns">
+    <button id="b-apply" class="primary">应用</button>
+    <button id="b-reset">恢复默认</button>
+  </div>
+</div>
+
+<div class="foot">
+  参数改完点「应用」立刻生效，不重编译不烧录。<br>
+  改到满意的组合，记得回代码里同步宏值并 git commit。
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const DEFAULTS = {tq:18, db:3.0, g:8, lim:200};
+let dragging = false;
+
+function fillTrack(el){
+  const p = (el.value - el.min) / (el.max - el.min) * 100;
+  el.style.setProperty('--p', p + '%');
+}
+
+['s-tq','s-db','s-g','s-lim'].forEach(id=>{
+  const el = $(id);
+  const lab = { 's-tq':'v-tq', 's-db':'v-db', 's-g':'v-g', 's-lim':'v-lim' }[id];
+  const fmt = { 's-tq':v=>v, 's-db':v=>Number(v).toFixed(1), 's-g':v=>v, 's-lim':v=>v }[id];
+  fillTrack(el);
+  el.addEventListener('input', ()=>{ $(lab).textContent = fmt(el.value); fillTrack(el); });
+  el.addEventListener('pointerdown', ()=> dragging = true);
+  el.addEventListener('pointerup',   ()=> dragging = false);
+});
+
+function apply(){
+  const q = `tq=${$('s-tq').value}&db=${$('s-db').value}&g=${$('s-g').value}&lim=${$('s-lim').value}`;
+  fetch('/api/set?' + q, {cache:'no-store'})
+    .then(r=>r.json()).then(render).catch(()=>{ $('sub').textContent = '应用失败，检查连接'; });
+}
+$('b-apply').onclick = apply;
+$('b-reset').onclick = ()=>{
+  $('s-tq').value = DEFAULTS.tq; $('s-db').value = DEFAULTS.db;
+  $('s-g').value = DEFAULTS.g;  $('s-lim').value = DEFAULTS.lim;
+  ['s-tq','s-db','s-g','s-lim'].forEach(id=>{
+    const el=$(id); fillTrack(el);
+    const lab = { 's-tq':'v-tq', 's-db':'v-db', 's-g':'v-g', 's-lim':'v-lim' }[id];
+    $(lab).textContent = id==='s-db' ? Number(el.value).toFixed(1) : el.value;
+  });
+  apply();
+};
+
+function badge(cond, txtOk, txtBad){
+  return `<span class="badge ${cond?'b-ok':'b-bad'}">${cond?txtOk:txtBad}</span>`;
+}
+
+function render(s){
+  if(!s || s.err){ $('sub').textContent = '设备无响应'; return; }
+
+  $('v-q').textContent = s.q;
+  $('v-q').style.color = s.q < 8 ? 'var(--bad)' : (s.q > 30 ? 'var(--warn)' : 'var(--ok)');
+
+  const direct = Math.abs(s.ratio) < 0.005;
+  $('v-ratio').textContent = (s.ratio>=0?'+':'') + s.ratio.toFixed(2) + '%';
+  $('v-ratio').style.color = direct ? 'var(--ok)' : 'var(--warn)';
+
+  const lat = s.q * 5 + 15 + 5;
+  $('v-lat').textContent = lat + 'ms';
+  $('v-lat').style.color = lat > 130 ? 'var(--warn)' : 'var(--ok)';
+
+  $('v-pkt').textContent = s.rate + '/s';
+  $('v-rssi').textContent = s.rssi + ' dBm';
+  $('v-rssi').style.color = s.rssi < -75 ? 'var(--bad)' : (s.rssi < -65 ? 'var(--warn)' : 'var(--ok)');
+  $('v-lost').innerHTML = s.lost + badge(s.lostpct < 1, '', '');
+  $('v-under').innerHTML = s.under + badge(s.under === 0, '', '');
+  $('v-pad').innerHTML = s.pad + badge(s.pad === 0, '', '');
+  $('v-plc').textContent = s.plc;
+  $('v-over').innerHTML = s.over + badge(s.over === 0, '', '');
+  $('v-clamp').innerHTML = s.clamp + badge(s.clamp === 0, '', '');
+  $('v-jump').textContent = s.jumpMax;
+  $('v-zero').textContent = s.zero + ' 帧';
+  $('v-rate').textContent = s.i2srate + ' Hz';
+  $('v-out').textContent = s.outrate.toFixed(1);
+
+  if(!dragging){
+    $('s-tq').value = s.tune.tq;  $('v-tq').textContent = s.tune.tq;  fillTrack($('s-tq'));
+    $('s-db').value = s.tune.db;  $('v-db').textContent = Number(s.tune.db).toFixed(1); fillTrack($('s-db'));
+    $('s-g').value  = s.tune.g;   $('v-g').textContent  = s.tune.g;   fillTrack($('s-g'));
+    $('s-lim').value= s.tune.lim; $('v-lim').textContent= s.tune.lim; fillTrack($('s-lim'));
+  }
+
+  $('sub').textContent = `直通${direct?'（零插值）':'（插值中）'} · 队列 ${s.qmin}~${s.qmax} · 更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
+}
+
+function poll(){
+  fetch('/api/state', {cache:'no-store'})
+    .then(r=>r.json()).then(render)
+    .catch(()=>{ $('sub').textContent = '设备无响应'; });
+}
+poll();
+setInterval(poll, 800);
+</script>
+</body>
+</html>
