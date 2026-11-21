@@ -90,7 +90,9 @@
   <div class="ctl">
     <div class="row"><label>目标水位 TARGET_Q</label><span class="val"><span id="v-tq">18</span> 包</span></div>
     <input type="range" id="s-tq" min="8" max="40" step="1" value="18">
-    <div class="hint">直接决定延时：1 包 = 5ms。改小省延时，低于 12 容易欠载。</div>
+    <div class="hint">直接决定延时：1 包 = 5ms。改小省延时，低于 12 容易欠载。<br>
+      <b>注意收敛慢</b>：增益 8 时队列每秒只降约 0.2 包，改完要等几十秒才到位 ——
+      页面上的「队列水位」是在慢慢往目标爬，不是没生效。</div>
   </div>
 
   <div class="ctl">
@@ -114,100 +116,160 @@
   </div>
 
   <div class="btns">
-    <button id="b-apply" class="primary">应用</button>
+    <button id="b-apply" class="primary">立即应用</button>
     <button id="b-reset">恢复默认</button>
   </div>
 </div>
 
 <div class="foot">
-  参数改完点「应用」立刻生效，不重编译不烧录。<br>
+  拖动滑块<b>松手后自动生效</b>，不用点应用，边听边调。<br>
   改到满意的组合，记得回代码里同步宏值并 git commit。
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
-const DEFAULTS = {tq:18, db:3.0, g:8, lim:200};
-let dragging = false;
+
+/* 控件表：滑块 id / 显示值 id / 后端字段名 / 格式化 */
+const CTLS = [
+  { s:'s-tq',  v:'v-tq',  key:'tq',  fmt:v => String(v) },
+  { s:'s-db',  v:'v-db',  key:'db',  fmt:v => Number(v).toFixed(1) },
+  { s:'s-g',   v:'v-g',   key:'g',   fmt:v => String(v) },
+  { s:'s-lim', v:'v-lim', key:'lim', fmt:v => String(v) },
+];
+
+/* editSeq 是这套界面的核心：每次用户动滑块就 +1。
+ * 请求是异步的，回包时若 editSeq 已变，说明用户又拖了新值，
+ * 这次回包就只更新状态区、不碰滑块。
+ * 这比原来的 dragging 标志可靠 —— 手机上手指滑出控件范围时
+ * pointerup 不触发，dragging 会永远卡在 true。 */
+let editSeq  = 0;
+let dirty    = false;   /* 有尚未成功下发的改动 */
+let inFlight = false;
+let timer    = null;
+let baseline = null;    /* 首次拉到的固件默认值，"恢复默认"回到这里 */
 
 function fillTrack(el){
   const p = (el.value - el.min) / (el.max - el.min) * 100;
   el.style.setProperty('--p', p + '%');
 }
 
-['s-tq','s-db','s-g','s-lim'].forEach(id=>{
-  const el = $(id);
-  const lab = { 's-tq':'v-tq', 's-db':'v-db', 's-g':'v-g', 's-lim':'v-lim' }[id];
-  const fmt = { 's-tq':v=>v, 's-db':v=>Number(v).toFixed(1), 's-g':v=>v, 's-lim':v=>v }[id];
-  fillTrack(el);
-  el.addEventListener('input', ()=>{ $(lab).textContent = fmt(el.value); fillTrack(el); });
-  el.addEventListener('pointerdown', ()=> dragging = true);
-  el.addEventListener('pointerup',   ()=> dragging = false);
-});
+function syncSliders(t){
+  CTLS.forEach(c => {
+    const el = $(c.s);
+    el.value = t[c.key];
+    $(c.v).textContent = c.fmt(el.value);
+    fillTrack(el);
+  });
+}
+
+function query(){
+  return CTLS.map(c => c.key + '=' + $(c.s).value).join('&');
+}
 
 function apply(){
-  const q = `tq=${$('s-tq').value}&db=${$('s-db').value}&g=${$('s-g').value}&lim=${$('s-lim').value}`;
-  fetch('/api/set?' + q, {cache:'no-store'})
-    .then(r=>r.json()).then(render).catch(()=>{ $('sub').textContent = '应用失败，检查连接'; });
+  clearTimeout(timer);
+  timer = null;
+  if (inFlight){ timer = setTimeout(apply, 150); return; }   /* 不并发，等上次回来 */
+
+  const seq = editSeq;
+  inFlight = true;
+  $('sub').textContent = '应用中…';
+
+  fetch('/api/set?' + query(), {cache:'no-store'})
+    .then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(s => {
+      if (seq === editSeq){          /* 期间没有新改动才算落地 */
+        dirty = false;
+        render(s);
+        $('sub').textContent += ' · 已生效';
+      } else {
+        render(s, true);             /* 只刷状态数字，滑块留给用户 */
+      }
+    })
+    .catch(() => {
+      $('sub').textContent = '应用失败，2 秒后重试';
+      timer = setTimeout(apply, 2000);
+    })
+    .finally(() => { inFlight = false; });
 }
-$('b-apply').onclick = apply;
-$('b-reset').onclick = ()=>{
-  $('s-tq').value = DEFAULTS.tq; $('s-db').value = DEFAULTS.db;
-  $('s-g').value = DEFAULTS.g;  $('s-lim').value = DEFAULTS.lim;
-  ['s-tq','s-db','s-g','s-lim'].forEach(id=>{
-    const el=$(id); fillTrack(el);
-    const lab = { 's-tq':'v-tq', 's-db':'v-db', 's-g':'v-g', 's-lim':'v-lim' }[id];
-    $(lab).textContent = id==='s-db' ? Number(el.value).toFixed(1) : el.value;
+
+CTLS.forEach(c => {
+  const el = $(c.s);
+  fillTrack(el);
+  el.addEventListener('input', () => {
+    $(c.v).textContent = c.fmt(el.value);
+    fillTrack(el);
+    editSeq++; dirty = true;
+    $('sub').textContent = '待应用…';
+    clearTimeout(timer);
+    timer = setTimeout(apply, 300);   /* 松手 300ms 后自动下发 */
   });
+});
+
+$('b-apply').onclick = () => { editSeq++; dirty = true; apply(); };
+
+$('b-reset').onclick = () => {
+  if (!baseline) return;
+  syncSliders(baseline);
+  editSeq++; dirty = true;
   apply();
 };
 
-function badge(cond, txtOk, txtBad){
-  return `<span class="badge ${cond?'b-ok':'b-bad'}">${cond?txtOk:txtBad}</span>`;
+function badge(cond, txt){
+  return `<span class="badge ${cond ? 'b-ok' : 'b-bad'}">${txt}</span>`;
 }
 
-function render(s){
-  if(!s || s.err){ $('sub').textContent = '设备无响应'; return; }
+/* keepSliders=true：只更新状态区，不动滑块（用户正在拖） */
+function render(s, keepSliders){
+  if (!s || s.err){ $('sub').textContent = '设备无响应'; return; }
+  if (!baseline) baseline = Object.assign({}, s.tune);
 
   $('v-q').textContent = s.q;
   $('v-q').style.color = s.q < 8 ? 'var(--bad)' : (s.q > 30 ? 'var(--warn)' : 'var(--ok)');
 
   const direct = Math.abs(s.ratio) < 0.005;
-  $('v-ratio').textContent = (s.ratio>=0?'+':'') + s.ratio.toFixed(2) + '%';
+  $('v-ratio').textContent = (s.ratio >= 0 ? '+' : '') + s.ratio.toFixed(2) + '%';
   $('v-ratio').style.color = direct ? 'var(--ok)' : 'var(--warn)';
 
   const lat = s.q * 5 + 15 + 5;
   $('v-lat').textContent = lat + 'ms';
   $('v-lat').style.color = lat > 130 ? 'var(--warn)' : 'var(--ok)';
 
-  $('v-pkt').textContent = s.rate + '/s';
+  $('v-pkt').textContent  = s.rate + '/s';
   $('v-rssi').textContent = s.rssi + ' dBm';
   $('v-rssi').style.color = s.rssi < -75 ? 'var(--bad)' : (s.rssi < -65 ? 'var(--warn)' : 'var(--ok)');
-  $('v-lost').innerHTML = s.lost + badge(s.lostpct < 1, '', '');
-  $('v-under').innerHTML = s.under + badge(s.under === 0, '', '');
-  $('v-pad').innerHTML = s.pad + badge(s.pad === 0, '', '');
+
+  $('v-lost').innerHTML  = s.lost + badge(s.lostpct < 1, s.lostpct < 1 ? '正常' : '偏高');
+  $('v-under').innerHTML = s.under + badge(s.under === 0, s.under === 0 ? '0' : '有');
+  $('v-pad').innerHTML   = s.pad + badge(s.pad === 0, s.pad === 0 ? '0' : '有');
   $('v-plc').textContent = s.plc;
-  $('v-over').innerHTML = s.over + badge(s.over === 0, '', '');
-  $('v-clamp').innerHTML = s.clamp + badge(s.clamp === 0, '', '');
+  $('v-over').innerHTML  = s.over + badge(s.over === 0, s.over === 0 ? '0' : '有');
+  $('v-clamp').innerHTML = s.clamp + badge(s.clamp === 0, s.clamp === 0 ? '0' : '有');
   $('v-jump').textContent = s.jumpMax;
   $('v-zero').textContent = s.zero + ' 帧';
   $('v-rate').textContent = s.i2srate + ' Hz';
-  $('v-out').textContent = s.outrate.toFixed(1);
+  $('v-out').textContent  = s.outrate.toFixed(1);
 
-  if(!dragging){
-    $('s-tq').value = s.tune.tq;  $('v-tq').textContent = s.tune.tq;  fillTrack($('s-tq'));
-    $('s-db').value = s.tune.db;  $('v-db').textContent = Number(s.tune.db).toFixed(1); fillTrack($('s-db'));
-    $('s-g').value  = s.tune.g;   $('v-g').textContent  = s.tune.g;   fillTrack($('s-g'));
-    $('s-lim').value= s.tune.lim; $('v-lim').textContent= s.tune.lim; fillTrack($('s-lim'));
-  }
+  /* 只有"没有未提交改动"时才让服务端值回写滑块。
+   * 原实现的 bug 就在这里：松开手指立刻 dragging=false，
+   * 800ms 后轮询拿服务端旧值把滑块拽回默认，用户来不及点应用。 */
+  if (!dirty && !keepSliders) syncSliders(s.tune);
 
-  $('sub').textContent = `直通${direct?'（零插值）':'（插值中）'} · 队列 ${s.qmin}~${s.qmax} · 更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
+  const mode = dirty ? '待应用' : (direct ? '直通·零插值' : '插值中');
+  $('sub').textContent = `${mode} · 队列 ${s.qmin}~${s.qmax} · ${new Date().toLocaleTimeString('zh-CN')}`;
 }
 
 function poll(){
+  if (inFlight) return;   /* 正在下发时别插一脚；待下发期间照常刷新状态区 */
   fetch('/api/state', {cache:'no-store'})
-    .then(r=>r.json()).then(render)
-    .catch(()=>{ $('sub').textContent = '设备无响应'; });
+    .then(r => r.json())
+    .then(s => render(s))
+    .catch(() => { $('sub').textContent = '设备无响应'; });
 }
+
 poll();
 setInterval(poll, 800);
 </script>
