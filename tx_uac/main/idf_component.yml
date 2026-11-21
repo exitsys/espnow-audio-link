@@ -1,0 +1,22 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=4.1.0'
+  # # Put list of dependencies here
+  # # For components maintained by Espressif:
+  # component: "~1.0.0"
+  # # For 3rd party components:
+  # username/component: ">=1.0.0,<2.0.0"
+  # username2/component2:
+  #   version: "~1.0.0"
+  #   # For transient dependencies `public` flag can be set.
+  #   # `public` flag doesn't have an effect dependencies of the `main` component.
+  #   # All dependencies of `main` are public by default.
+  #   public: true
+  ## 打补丁的本地副本（修 SPK 侧 FIFO 水位被抽干导致 feedback 把主机催到 1.8 倍速率）。
+  ## 原版在 tx/managed_components/ 下已移除，若要回退：删掉 override_path 两行，
+  ## 再从 backup/alt_uac_orig_20261119/ 恢复组件。
+  espressif/usb_device_uac:
+    version: "*"
+    override_path: "../components/usb_device_uac"

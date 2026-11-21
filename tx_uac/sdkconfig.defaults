@@ -1,0 +1,28 @@
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ---- USB Audio Class（音源） ----
+# 立体声扬声器，不要麦克风。通道数为 0 的 direction 会整个从描述符里去掉。
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=2
+CONFIG_UAC_MIC_CHANNEL_NUM=0
+# 48k 是 Android 的原生速率，链路也按 48k 跑，不做重采样
+CONFIG_UAC_SAMPLE_RATE=48000
+CONFIG_UAC_BIT_RESOLUTION_16=y
+
+# 必须关掉 USB 次要控制台。ESP32-S3 的 USB-OTG（UAC 用）和 USB-Serial-JTAG
+# 是同一组物理引脚 GPIO19/20，secondary console 会占着 USB PHY 跟 UAC 打架。
+# 关掉之后日志只走 UART0（GPIO43/44），必须接 USB-TTL 才能看串口。
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED is not set
+
+# ---- WiFi ----
+# 音频包 5ms 一个，lwIP 默认 6 个 recvmbox 位置撑不住调度延迟
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
+
+# USB 任务必须高于 tx_task(6)：UAC 每 1ms 要取 192 字节，
+# 被拼包任务压在后面就会整批迟到，接收端队列跟着抖。
+CONFIG_UAC_TINYUSB_TASK_PRIORITY=10
+CONFIG_UAC_SPK_TASK_PRIORITY=10

@@ -1,0 +1,19 @@
+# ESP-IDF 构建产物
+build/
+managed_components/
+*.bin
+*.elf
+*.map
+*.hex
+*.obj
+*.o
+*.a
+
+# 配置备份（IDF 自动生成）
+sdkconfig.old
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

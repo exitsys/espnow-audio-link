@@ -1,0 +1,97 @@
+#include "adpcm.h"
+
+static const int8_t index_table[16] = {
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+static const int16_t step_table[89] = {
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544,
+    598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878,
+    2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894,
+    6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818,
+    18500, 20350, 22385, 24623, 27086, 29794, 32767
+};
+
+void adpcm_reset(adpcm_state_t *st)
+{
+    st->valprev = 0;
+    st->index = 0;
+}
+
+static inline int16_t clamp16(int32_t v)
+{
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
+static inline uint8_t encode_one(int16_t sample, adpcm_state_t *st)
+{
+    int step = step_table[st->index];
+    int32_t diff = (int32_t)sample - st->valprev;
+    uint8_t code = 0;
+
+    if (diff < 0) {
+        code = 8;
+        diff = -diff;
+    }
+    if (diff >= step)          { code |= 4; diff -= step; }
+    if (diff >= (step >> 1))   { code |= 2; diff -= (step >> 1); }
+    if (diff >= (step >> 2))   { code |= 1; }
+
+    int32_t delta = step >> 3;
+    if (code & 4) delta += step;
+    if (code & 2) delta += step >> 1;
+    if (code & 1) delta += step >> 2;
+
+    if (code & 8) st->valprev -= delta;
+    else          st->valprev += delta;
+    st->valprev = clamp16(st->valprev);
+
+    st->index += index_table[code & 0x0F];
+    if (st->index < 0)  st->index = 0;
+    if (st->index > 88) st->index = 88;
+
+    return code;
+}
+
+static inline int16_t decode_one(uint8_t code, adpcm_state_t *st)
+{
+    int step = step_table[st->index];
+
+    int32_t delta = step >> 3;
+    if (code & 4) delta += step;
+    if (code & 2) delta += step >> 1;
+    if (code & 1) delta += step >> 2;
+
+    if (code & 8) st->valprev -= delta;
+    else          st->valprev += delta;
+    st->valprev = clamp16(st->valprev);
+
+    st->index += index_table[code & 0x0F];
+    if (st->index < 0)  st->index = 0;
+    if (st->index > 88) st->index = 88;
+
+    return (int16_t)st->valprev;
+}
+
+void adpcm_encode_block(const int16_t *in, uint8_t *out, int nsamples, adpcm_state_t *st)
+{
+    for (int i = 0; i < nsamples; i += 2) {
+        uint8_t lo = encode_one(in[i], st);
+        uint8_t hi = encode_one(in[i + 1], st);
+        out[i >> 1] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
+void adpcm_decode_block(const uint8_t *in, int16_t *out, int nsamples, adpcm_state_t *st)
+{
+    for (int i = 0; i < nsamples; i += 2) {
+        uint8_t b = in[i >> 1];
+        out[i]     = decode_one(b & 0x0F, st);
+        out[i + 1] = decode_one((b >> 4) & 0x0F, st);
+    }
+}
