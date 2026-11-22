@@ -29,6 +29,7 @@
  * ---------------------------------------------------------------------------
  */
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
@@ -155,11 +156,41 @@ static StreamBufferHandle_t s_pcm_sb;
  *
  * 976 字节一包靠 ESP-NOW v2（上限 1470），两端 IDF 都是 5.5，不需要分片。
  */
-#ifndef RX_MAC_ADDR
-#define RX_MAC_ADDR  { 0x84, 0xC7, 0xBB, 0x5A, 0x73, 0x94 }   /* 84:C7:BB:5A:73:94 */
+/* 接收端 MAC：menuconfig 里配（Component config → Audio link → 接收端 MAC 地址），
+ * 不需要改代码。没配时退回下面的默认值，保证老固件行为不变。 */
+#ifndef CONFIG_ALINK_RX_MAC
+#define CONFIG_ALINK_RX_MAC "84:c7:bb:5a:73:94"
 #endif
 
-static const uint8_t s_peer[ESP_NOW_ETH_ALEN] = RX_MAC_ADDR;
+static uint8_t s_peer[ESP_NOW_ETH_ALEN];
+
+/* 解析 "aa:bb:cc:dd:ee:ff" 或 "aa-bb-cc-dd-ee-ff"。
+ * 解析失败返回 false，调用方退到默认 MAC —— 比直接编译期报错友好：
+ * 用户填个 "84C7BB5A7394" 也能用，而不是烧进去以后一声不响。 */
+static bool mac_from_str(const char *s, uint8_t out[ESP_NOW_ETH_ALEN])
+{
+    unsigned v[ESP_NOW_ETH_ALEN];
+    const int n = sscanf(s, "%x:%x:%x:%x:%x:%x",
+                         &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+    if (n != ESP_NOW_ETH_ALEN &&
+        sscanf(s, "%x-%x-%x-%x-%x-%x",
+               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != ESP_NOW_ETH_ALEN) {
+        /* 也接受不带分隔符的 12 位十六进制 */
+        unsigned long long all = 0;
+        if (sscanf(s, "%12llx", &all) != 1) {
+            return false;
+        }
+        for (int i = ESP_NOW_ETH_ALEN - 1; i >= 0; i--) {
+            out[i] = (uint8_t)(all & 0xFF);
+            all >>= 8;
+        }
+        return true;
+    }
+    for (int i = 0; i < ESP_NOW_ETH_ALEN; i++) {
+        out[i] = (uint8_t)v[i];
+    }
+    return true;
+}
 static volatile uint32_t s_ack_ok, s_ack_fail;
 static volatile int64_t  s_ack_ok_us;      /* 最近一次收到 ACK 的时刻 */
 
@@ -194,6 +225,15 @@ static void wifi_espnow_init(void)
     esp_err_t r = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_11M_L);
     if (r != ESP_OK) ESP_LOGW(TAG, "config_espnow_rate: %s", esp_err_to_name(r));
 #pragma GCC diagnostic pop
+
+    /* 解析 menuconfig 里的接收端 MAC。填错就退回默认值并报出来，
+     * 免得「烧进去没声音、还不知道是地址写错了」。 */
+    if (!mac_from_str(CONFIG_ALINK_RX_MAC, s_peer)) {
+        const char *fb = "84:c7:bb:5a:73:94";
+        mac_from_str(fb, s_peer);
+        ESP_LOGE(TAG, "CONFIG_ALINK_RX_MAC=\"%s\" 格式非法，改用默认 %s",
+                 CONFIG_ALINK_RX_MAC, fb);
+    }
 
     esp_now_peer_info_t peer = { 0 };
     memcpy(peer.peer_addr, s_peer, ESP_NOW_ETH_ALEN);

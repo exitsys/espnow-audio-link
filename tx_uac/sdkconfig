@@ -598,6 +598,12 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# Audio link
+#
+CONFIG_ALINK_RX_MAC="84:c7:bb:5a:73:94"
+# end of Audio link
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y

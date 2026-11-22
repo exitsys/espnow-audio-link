@@ -463,7 +463,8 @@ static void pin_scan_run(void)
 /* ---------- 输出：所有不连续点都在这里抹平 ---------- */
 
 static int16_t s_tail[ALINK_XFADE_FRAMES][2];   /* 上一次输出的最后 2ms */
-static bool    s_xfade;                          /* 下次输出需要淡入 */
+static bool    s_xfade;                          /* 下次输出需要淡入（2ms 接缝淡化） */
+static int     s_fade_in_left;                   /* 长淡入剩余帧数（断流恢复/时钟重配） */
 static int16_t s_prev[ALINK_FRAMES_PER_PKT * ALINK_CHANNELS];  /* 上一整包，PLC 外推基准 */
 static uint8_t s_plc_run;                        /* 连续 PLC 次数 */
 static uint32_t s_plc_total;                     /* 累计 PLC 次数，供日志 */
@@ -595,6 +596,8 @@ static uint32_t s_phase_clamp = 0;           /* 相位钳位次数（应为 0；
  * 残余的亚 Hz 误差交给水位闭环的死区慢慢吸收。 */
 static volatile uint32_t s_i2s_rate = ALINK_I2S_RATE;
 static volatile int32_t  s_clk_req  = 0;     /* 非 0 = 请播放任务切到该采样率 */
+static int      s_clk_pending = 0;           /* 已接单、待切换的目标采样率，0 = 无 */
+static int      s_clk_fade    = 0;           /* >0 = 重配前还剩几包要淡出 */
 static uint32_t s_rate_frames = 0;           /* 测速窗口内累计到达帧数 */
 static int64_t  s_rate_t0     = 0;           /* 测速窗口起点 */
 static int      s_rate_prev   = 0;           /* 上一窗口测出的帧率，用于去抖 */
@@ -1098,6 +1101,21 @@ static void emit(const int16_t *src)
         s_xfade = false;
     }
 
+    /* 断流恢复 / 时钟重配后的长淡入：从静音线性升到满幅。
+     *
+     * 不能和上面那道 2ms 接缝淡化合并 —— 那个是「旧波形 → 新波形」，
+     * 两侧都有信号，2ms 够；这里是「静音 → 满幅」，2ms 等于阶跃，
+     * 低频上就是一次冲击。15ms 才能做到听不出起点。 */
+    if (s_fade_in_left > 0) {
+        const int32_t total = ALINK_FADE_IN_FRAMES;
+        for (int i = 0; i < nout && s_fade_in_left > 0; i++) {
+            const int32_t w = ((total - s_fade_in_left + 1) << 16) / total;
+            out[i * 2]     = (int16_t)(((int32_t)out[i * 2]     * w) >> 16);
+            out[i * 2 + 1] = (int16_t)(((int32_t)out[i * 2 + 1] * w) >> 16);
+            s_fade_in_left--;
+        }
+    }
+
     /* 固定电平校准 + 抖动。
      * 本版沿用老哥的设计，没有实现 UAC 音量（set_volume_cb 只打日志），
      * 而 PCM5102A 满刻度是 2.1Vrms，对有源音箱是 12~20dB 的结构性过载。
@@ -1170,6 +1188,19 @@ static void emit(const int16_t *src)
          * 全部作用完之后的结果，前面任何一步引入的断层都会在这里现形。 */
         jump_check_block((const int16_t (*)[ALINK_CHANNELS])acc,
                          ALINK_FRAMES_PER_PKT);
+
+        /* 时钟重配前的淡出：把这一包真实音频按线性斜坡压向 0。
+         * 放在这里而不是 emit() 开头，是因为 acc 才是真正送进 DMA 的
+         * 那 240 帧 —— 重采样、淡化、电平校准全部作用完之后的结果。
+         * 最后一包 gain 正好为 0，DMA 排空时 DAC 收到的是静音。 */
+        if (s_clk_fade > 0) {
+            const int32_t g = ((s_clk_fade - 1) * 256) / ALINK_CLK_FADE_PKTS;
+            int16_t *p = &acc[0][0];
+            for (int i = 0; i < ALINK_FRAMES_PER_PKT * ALINK_CHANNELS; i++) {
+                p[i] = (int16_t)(((int32_t)p[i] * g) >> 8);
+            }
+            s_clk_fade--;
+        }
 
         size_t written = 0;
         const size_t want = (size_t)ALINK_FRAMES_PER_PKT * ALINK_CHANNELS * sizeof(int16_t);
@@ -1457,14 +1488,28 @@ static void play_task(void *arg)
     uint32_t starve = 0;
 
     s_xfade = true;   /* 首次输出从静音淡入 */
+    s_fade_in_left = ALINK_FADE_IN_FRAMES;
 
     while (1) {
         /* ---- 把 I2S 时钟对齐到音源 ----
+         *
          * 只有本任务能碰 I2S 通道，所以重配放在这里、包边界处执行。
-         * disable/enable 会让 DMA 停一下，用淡入盖掉那一下爆音。 */
+         * 但 disable/enable 会把 DMA 停一下，而 DMA 里通常还压着
+         * 10~15ms 已经写进去的音频 —— 直接停，DAC 那头听到的就是
+         * 「波形从中间被砍断」，切歌那声爆音有一半来自这里。
+         *
+         * 所以分两步：先接单，再按 6 包（30ms）把真实音频线性压到 0，
+         * 等最后一包已经写成静音，才真正 disable/enable。 */
         if (s_clk_req != 0) {
-            const int target = (int)s_clk_req;
-            s_clk_req = 0;
+            if (s_clk_pending == 0 && s_clk_fade == 0) {
+                s_clk_pending = (int)s_clk_req;
+                s_clk_fade    = ALINK_CLK_FADE_PKTS;
+            }
+            s_clk_req = 0;      /* 淡出期间来的新请求丢掉，切完重新测 */
+        }
+        if (s_clk_pending != 0 && s_clk_fade == 0) {
+            const int target = s_clk_pending;
+            s_clk_pending = 0;
             i2s_channel_disable(s_i2s_tx);
             i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)target);
 #if ALINK_I2S_CLK_240M
@@ -1481,7 +1526,9 @@ static void play_task(void *arg)
             } else {
                 ESP_LOGE(TAG, "I2S 时钟重配失败 %d，保持 %lu Hz", (int)r, (unsigned long)s_i2s_rate);
             }
-            s_xfade = true;
+            /* 恢复时用长淡入，不是 2ms 硬接 —— 停顿过后 DAC 那头是静音 */
+            s_fade_in_left = ALINK_FADE_IN_FRAMES;
+            s_xfade = false;
         }
 
         int d = q_depth();
@@ -1548,6 +1595,11 @@ static void play_task(void *arg)
         }
 
         if (q_pop(pcm, &is_fill)) {
+            /* 断流超过 20ms 才恢复 → 中间是真静音，必须走长淡入。
+             * 短缺口（PLC 接续、漂移丢包）仍交给 2ms 接缝淡化。 */
+            if (starve >= ALINK_RESUME_GAP_PKTS && s_fade_in_left == 0) {
+                s_fade_in_left = ALINK_FADE_IN_FRAMES;
+            }
             starve = 0;
             if (is_fill) {
                 emit_plc();          /* 占位包走外推，不补静音 */

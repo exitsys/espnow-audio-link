@@ -1,0 +1,21 @@
+# 统一换行：仓库内存 LF，检出时按平台
+* text=auto
+
+*.c      text eol=lf
+*.h      text eol=lf
+*.cpp    text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.csv    text eol=lf
+*.py     text eol=lf
+*.sh     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+CMakeLists.txt  text eol=lf
+sdkconfig.defaults text eol=lf
+
+# 二进制不要碰
+*.bin    binary
+*.png    binary
+*.jpg    binary
+*.pdf    binary

@@ -1,0 +1,12 @@
+menu "Audio link"
+
+    config ALINK_RX_MAC
+        string "接收端 MAC 地址"
+        default "84:c7:bb:5a:73:94"
+        help
+            接收端那块 ESP32 的 WiFi MAC，格式 aa:bb:cc:dd:ee:ff（大小写都行，
+            也接受 aa-bb-cc-dd-ee-ff）。ESP-NOW 是单播，必须知道对端地址。
+
+            接收端上电时串口会打印自己的 MAC，抄过来填这里，再重新编译烧录。
+
+endmenu

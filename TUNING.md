@@ -8,8 +8,12 @@
 |---|---|
 | `ALINK_TARGET_Q` / `ALINK_Q_HIGH` / `ALINK_Q_DEPTH` | `components/alink_common/include/alink_common.h` |
 | `ALINK_SRC_DEADBAND` / P 控制增益 / `I2S_DMA_DESC` | `rx_uac/main/alink_rx.c` |
+| `ALINK_FADE_IN_FRAMES` / `ALINK_RESUME_GAP_PKTS` / `ALINK_CLK_FADE_PKTS` | `components/alink_common/include/alink_common.h` |
 
-TX 侧（`tx_uac/main/alink_tx.c`）只影响拼包和补位淡出，不影响水位。
+淡化的三个参数会影响「切歌顺不顺」，不影响延时和水位，调音质时不用动它们。
+
+TX 侧（`tx_uac/main/alink_tx.c`）只影响拼包和补位淡出，不影响水位；
+接收端 MAC 走 menuconfig（`Component config → Audio link → 接收端 MAC 地址`）。
 
 ## 档位对照
 
@@ -61,11 +65,19 @@ P 控制重新直接读 `ALINK_TARGET_Q` / `ALINK_SRC_DEADBAND` / `ALINK_SRC_ADJ
    时每包丢 0.7~1.7 帧相位，等于 200 次/秒硬跳变。已改成允许负相位
    （历史区 32 帧），日志里看 `相位钳` 计数，正常应为 0。
 
-5. **切歌爆音**还没定位。可疑点按优先级：
-   - `s_clk_req` 触发的 `i2s_channel_disable/enable`（采样率变了才触发，
-     所以是「一定概率」）——2ms 淡化盖不住 DMA 停顿
-   - TX 补位淡入只有 2.67ms，从 0 到满幅对低频是冲击
-   - RX `ALINK_XFADE_FRAMES` 只有 2ms，切歌后从旧波形跳到新歌开头
+5. **切歌爆音**：三个来源叠加，2026-11-22 一并处理。
+   - `i2s_channel_reconfig_std_clock()` **必须先 disable**（IDF 的硬要求，见
+     `i2s_std.h` 注释），而 DMA 里还压着 10~15ms 已写入的音频。直接停
+     = 波形从中间砍断。**现在先接单，按 6 包（`ALINK_CLK_FADE_PKTS`）把真实
+     音频线性压到 0，最后一包 gain 正好为 0，才真正 disable/enable。**
+   - 恢复时的 2ms 交叉淡化是给「接缝」用的（两侧都有信号）。断流恢复时
+     前面是静音，从静音到满幅只给 2ms = 阶跃，低频上就是一次冲击。
+     **现在断流超过 `ALINK_RESUME_GAP_PKTS`（4 包 = 20ms）就改走
+     `ALINK_FADE_IN_FRAMES`（15ms）长淡入。**
+   - TX 补位段的淡出只有 2.67ms，同源问题，已按 Q8 包络拉长到约 10ms。
+
+   2ms 接缝淡化仍然保留 —— 它解决的是 PLC 接续、漂移丢包这类
+   「两侧都有信号」的场合，和长淡入是两件事，不要合并。
 
 ## 回退方法
 
