@@ -70,7 +70,7 @@ P 控制重新直接读 `ALINK_TARGET_Q` / `ALINK_SRC_DEADBAND` / `ALINK_SRC_ADJ
 ## 回退方法
 
 ```bash
-cd <仓库目录>
+cd espnow_audio
 git log --oneline          # 看历史
 git tag -l                 # 看档位标签
 git checkout v1.0-direct-95ms -- .
