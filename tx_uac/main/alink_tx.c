@@ -417,30 +417,37 @@ static void tx_task(void *arg)
         }
 
         /* ---- 音量作用到样本 ----
-         * 目标增益走斜坡（一包移动剩余量的 1/8，约 40ms 到位），
-         * 拖音量条时不会出现台阶声。65536 是 0dB，直接跳过省 CPU。 */
+         * 旧写法每包只走剩余量的 1/8：时间常数 40ms，实际从 -50dB 拉到 0dB
+         * 要 170ms 才稳。而主机拖音量条时目标每秒变几十次，增益永远落后于
+         * 手指 —— 表现就是「晃几下就不跟手，松手半天才到位置」。
+         *
+         * 改成包内线性插值：一包（5ms）内从当前值走到目标。
+         * 样本级连续，没有「一包一个台阶」的块间跳变；5ms 的斜率等同于
+         * 一次正常淡入淡出，听不出音量的突变感。 */
         {
             static int32_t g_cur = 65536;
             const int32_t g_tgt = s_muted ? 0 : s_vol_q16;
-            if (g_cur != g_tgt) {
-                int32_t d = g_tgt - g_cur;
-                int32_t step = d / 8;
-                if (step == 0) {
-                    step = (d > 0) ? 1 : -1;
+            const int nfr = (int)(total / ALINK_FRAME_BYTES);
+            int16_t *s16 = (int16_t *)pcm;
+
+            if (nfr > 0 && g_cur != g_tgt) {
+                /* 均摊到每帧。差值小于帧数时至少走 1，否则会永远差几 LSB 追不上 */
+                int32_t per = (g_tgt - g_cur) / nfr;
+                if (per == 0) {
+                    per = (g_tgt > g_cur) ? 1 : -1;
                 }
-                g_cur += step;
-                if ((d > 0 && g_cur > g_tgt) || (d < 0 && g_cur < g_tgt)) {
-                    g_cur = g_tgt;
-                }
-            }
-            if (g_cur != 65536 && total >= ALINK_FRAME_BYTES) {
-                int16_t *s16 = (int16_t *)pcm;
-                /* 只作用到真实样本：补位段是用 s_last（已含音量）派生的，
-                 * 再乘一次会变成二次衰减，淡出听起来像音量在抖。 */
-                const int ns = (int)(total / 2);
-                for (int i = 0; i < ns; i++) {
+                for (int i = 0; i < nfr; i++) {
+                    g_cur += per;
+                    if ((per > 0 && g_cur > g_tgt) || (per < 0 && g_cur < g_tgt)) {
+                        g_cur = g_tgt;
+                    }
                     /* +32768 是四舍五入。原来直接 >>16 属截断，误差恒为负，
                      * 会变成与信号相关的失真（有声段才听得到的轻微噼啪）。 */
+                    s16[2 * i]     = (int16_t)((((int32_t)s16[2 * i]     * g_cur) + 32768) >> 16);
+                    s16[2 * i + 1] = (int16_t)((((int32_t)s16[2 * i + 1] * g_cur) + 32768) >> 16);
+                }
+            } else if (nfr > 0 && g_cur != 65536) {
+                for (int i = 0; i < nfr * 2; i++) {
                     s16[i] = (int16_t)((((int32_t)s16[i] * g_cur) + 32768) >> 16);
                 }
             }

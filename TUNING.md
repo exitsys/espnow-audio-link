@@ -23,26 +23,22 @@ TX 侧（`tx_uac/main/alink_tx.c`）只影响拼包和补位淡出，不影响�
 设备侧延时 = 队列包数 × 5ms + DMA × 5ms + 空口/拼包 5ms。
 接 PC 再加 WASAPI 25ms + USB 2ms；接魔百盒另算。
 
-## 内网调参面板
+## 调参方式：编译期宏（网页面板已移除）
 
-手机连热点 `alink-rx`（密码 `********`）→ 浏览器开 `http://192.168.4.1/`。
-四个参数（TARGET_Q / 死区 / 增益 / 重采样上限）是运行时变量，**拖动松手即生效**，
-不用重编译烧录。热点的信道跟着 `ALINK_WIFI_CHANNEL`（11），不打断 ESP-NOW。
+参数只有 6 个，改完重新编译烧录。**不要再加回 WiFi 调参面板。**
 
-相关文件：`rx_uac/main/web_ui.c`（HTTP 接口）、`web_ui.h`（结构体）、
-`index.html`（页面，`EMBED_TXTFILES` 编进 flash）。
+2026-11-22 移除了 SoftAP + HTTP 调参页面，原因：ESP-NOW 是 200 包/秒、
+11Mbps 固定速率的连续音频流，SoftAP 的 beacon 是广播、HTTP 响应是突发，
+两者都在和音频抢同一个射频，实测丢包明显上升。射频上只留 ESP-NOW 一种业务。
 
-**已修的坑：滑块自动弹回默认值。**
-原实现靠 `pointerdown/pointerup` 维护 `dragging` 标志，判断「用户是否正在拖」。
-问题是松手瞬间 `dragging` 就变 false，而状态每 800ms 轮询一次、拿服务端旧值
-无条件回写滑块 —— 用户根本来不及点「应用」，看起来就是「拖了又弹回去」。
-现在改成两件事：拖动 300ms 后自动下发；用 `editSeq` 版本号判断回包是否过期，
-有未提交改动时轮询只刷状态区、不碰滑块。
+移除的范围：`web_ui.c` / `web_ui.h` / `index.html`、`EMBED_TXTFILES`、
+`esp_http_server` 组件、`s_tune_*` 四个 volatile 变量、`alink_get_stats/
+get_tune/set_tune`、`alink_rx_restart_stream`、`WIFI_MODE_APSTA` 与 AP 配置。
+P 控制重新直接读 `ALINK_TARGET_Q` / `ALINK_SRC_DEADBAND` / `ALINK_SRC_ADJ_LIMIT`，
+增益写死 8.0。
 
-回归测试：`node tools/web_test.js`（12 项，含失败重试不丢改动）。
-
-**注意收敛慢**：改 TARGET_Q 后队列按每秒约 0.2 包（增益 8）逼近目标，
-29→18 要一分钟。页面上的队列数字是在慢慢爬，不是没生效。
+**收敛慢是物理特性，不是 bug**：改 `ALINK_TARGET_Q` 后队列按每秒约 0.2 包
+（增益 8）逼近目标，29→18 要一分钟。烧录后看串口日志的「队列」慢慢爬是正常的。
 
 ## 踩过的坑（别重复推导）
 

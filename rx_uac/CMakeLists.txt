@@ -23,7 +23,6 @@ set(COMPONENTS
     esp_driver_i2s
     esp_driver_gpio
     esp_ringbuf
-    esp_http_server
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

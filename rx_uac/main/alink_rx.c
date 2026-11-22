@@ -63,7 +63,6 @@
 #include "driver/gpio.h"
 
 #include "alink_common.h"
-#include "web_ui.h"
 
 static const char *TAG = "alink_rx";
 
@@ -649,22 +648,6 @@ static uint32_t s_zero_run_max = 0;
  * 这种振荡 —— 那正是欠载和 overrun 交替出现的原因，必须看极值才看得见。 */
 static int s_q_min = 1 << 20;
 static int s_q_max = 0;
-
-/* ---------- 运行时可调参数（网页/串口改，不重编译） ----------
- *
- * 单独拆成 volatile 标量而不是一个结构体：core0 上的 HTTP 任务写、
- * core1 上的播放任务读，32 位对齐的标量在 Xtensa 上是单指令读写，
- * 不需要加锁也不会读到撕裂的值；结构体整体赋值反而可能被编译器拆成多次访问。
- *
- * 初始值仍取编译期宏，保证「不碰网页」时行为和原来完全一致。
- */
-static volatile int32_t s_tune_target_q = ALINK_TARGET_Q;
-static volatile float   s_tune_deadband = ALINK_SRC_DEADBAND;
-static volatile float   s_tune_gain     = 8.0f;
-static volatile int32_t s_tune_adj_lim  = ALINK_SRC_ADJ_LIMIT;
-
-/* web 每秒读一次的状态快照（由 rx_task 在刷日志时填） */
-static alink_stats_t s_stats;
 
 /* 最近 4 次跳变的详情，供日志回看。用户听到爆音后报个大概时间，
  * 就能靠这几条对上「是哪种跳变」。 */
@@ -1273,34 +1256,16 @@ static void wifi_espnow_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    /* AP 的 netif 必须在 wifi_init 之前建好，否则 SoftAP 拿不到 IP，
-     * 192.168.4.1 会一直 ping 不通。ESP-NOW 本身不需要 IP，
-     * 但调参面板要走 HTTP，就得有这一层。 */
-    esp_netif_create_default_wifi_ap();
-
+    /* 纯 STA，不连路由器，只用来把信道钉在 ALINK_WIFI_CHANNEL。
+     *
+     * 这里曾经跑过 APSTA + HTTP 调参面板，结果是丢包明显变多：
+     * SoftAP 的 beacon 是广播、HTTP 响应是突发，两者都在和 5ms 一包的
+     * ESP-NOW 抢同一个射频；11Mbps 固定速率下空口余量本来就薄。
+     * 调参已改回编译期宏，射频上只留 ESP-NOW 一种业务。 */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-    /* APSTA：STA 侧给 ESP-NOW（不连路由器，只用来定信道），
-     * AP 侧给手机/电脑连进来调参。
-     *
-     * 信道必须是 ALINK_WIFI_CHANNEL，两边一致 —— ESP-NOW 要求收发同信道，
-     * 一旦 AP 起在别的信道，TX 那边就彻底联系不上了。
-     * beacon 间隔放到 500ms（默认 100ms）：beacon 是广播，会占空口时间，
-     * 拉长一点能少干扰 5ms 一包的音频流。 */
-    wifi_config_t ap_cfg = { 0 };
-    strcpy((char *)ap_cfg.ap.ssid, "alink-rx");
-    strcpy((char *)ap_cfg.ap.password, "********");
-    ap_cfg.ap.ssid_len        = (uint8_t)strlen("alink-rx");
-    ap_cfg.ap.channel         = ALINK_WIFI_CHANNEL;
-    ap_cfg.ap.authmode        = WIFI_AUTH_WPA2_PSK;
-    ap_cfg.ap.max_connection  = 2;
-    ap_cfg.ap.beacon_interval = 500;
-    ap_cfg.ap.pmf_cfg.required = false;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));       /* 关省电，这项最能压延迟 */
     ESP_ERROR_CHECK(esp_wifi_set_channel(ALINK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
@@ -1454,33 +1419,6 @@ static void rx_task(void *arg)
                     (int32_t)(s_dma_done * (uint32_t)ALINK_FRAMES_PER_PKT) -
                     (int32_t)s_out_frames;
 
-                /* 顺手给网页快照一份。放在日志旁边是刻意的：两边数字永远一致，
-                 * 不用为了 web 再算一遍，也就不会出现「网页和串口对不上」的扯皮。 */
-                s_stats.pkt         = got;
-                s_stats.lost        = lost;
-                s_stats.dup         = dup;
-                s_stats.pad         = pad;
-                s_stats.filled      = filled;
-                s_stats.plc         = s_plc_total;
-                s_stats.overrun     = overrun;
-                s_stats.drift_drop  = s_drift_drop;
-                s_stats.i2s_err     = s_i2s_err;
-                s_stats.underrun    = s_underrun;
-                s_stats.phase_clamp = s_phase_clamp;
-                s_stats.queue       = q_depth();
-                s_stats.q_min       = s_q_min;
-                s_stats.q_max       = s_q_max;
-                s_stats.ratio_pct   = (float)(s_src_ratio - 65536) * 100.0f / 65536.0f;
-                s_stats.out_rate    = (float)out_rate;
-                s_stats.peak_dbfs   = (float)dbfs;
-                s_stats.rssi        = s_peer_rssi;
-                s_stats.zero_run_max= s_zero_run_max;
-                s_stats.dma_gap     = dma_gap;
-                s_stats.jump_edge   = s_jump_edge;
-                s_stats.jump_mid    = s_jump_mid;
-                s_stats.jump_max    = s_jump_max;
-                s_stats.i2s_rate    = (int32_t)s_i2s_rate;
-
                 ESP_LOGI(TAG, "包=%lu 丢=%lu(%.2f%%) 重复=%lu 补位=%lu 占位=%lu PLC=%lu 溢出=%lu 漂移丢=%lu 重采样=%+.2f%% I2S错=%lu 欠载=%lu 队列=%d(%d~%d) 输出=%.1f帧/秒 峰=%.1fdBFS RSSI=%d 跳变=%lu(边%lu/中%lu) 最大=%ld 零串=%lu帧(%lums) DMA余=%ld 相位钳=%lu",
                          (unsigned long)got, (unsigned long)lost,
                          got ? lost * 100.0 / (got + lost) : 0.0,
@@ -1580,32 +1518,31 @@ static void play_task(void *arg)
             /* 不在这里刷日志：水位高时一秒几百条，串口会把播放任务堵死 */
         }
         {
-            /* 死区：队列在目标水位 ±0.75 包之内时一律不做重采样。
+            /* 死区：队列在目标水位 ±ALINK_SRC_DEADBAND 之内时一律不做重采样。
              * ratio 精确等于 1.0 时 src_process 全程走整数帧直取分支，
              * 一个插值样本都不产生 —— 这是消除高频「调频干扰」的唯一办法
              * （只要 ratio 偏离 1，包边界就得拿镜像样本顶替，残差 -30dB 起步，
-             * 加抽头也压不掉，实测见 src_selftest）。 */
-            const float dev = ema - (float)s_tune_target_q;
+             * 加抽头也压不掉）。死区 3.0 是实测出来的音质底线。 */
+            const float dev = ema - (float)ALINK_TARGET_Q;
             int32_t adj;
-            if (dev > -s_tune_deadband && dev < s_tune_deadband) {
+            if (dev > -ALINK_SRC_DEADBAND && dev < ALINK_SRC_DEADBAND) {
                 adj = 0;
             } else {
-                const float eff = dev - (dev > 0 ? s_tune_deadband : -s_tune_deadband);
+                const float eff = dev - (dev > 0 ? ALINK_SRC_DEADBAND : -ALINK_SRC_DEADBAND);
                 /* 增益 64→8。实测收发时钟差只有 0.011%（约 5.5 帧/秒），
                  * 用 64 的增益意味着队列偏 10 包就把调整量推到硬件上限，
                  * 于是「冲过头→反向冲」，队列在 1 和 24 之间来回撞。
                  * 8 的增益下，偏 10 包只给 0.07%，慢慢收敛，不产生音高可闻的摆动。
                  *
-                 * 2026-11-21 回到 8：低延时档曾提到 16 去追盒子 0.146% 的失配，
-                 * 但增益 16 + 死区 1.5 的组合让 ratio 每秒都在变，
-                 * 插值器全程不退出。宁可收敛慢一点，也要让 ratio 落在 1.0 上直通。 */
-                adj = (int32_t)(eff * s_tune_gain);
+                 * 不要再为了省延时把增益提到 16：那样 ratio 每秒都在变，
+                 * 插值器全程退不出来，小电平乐器就开始发糊。 */
+                adj = (int32_t)(eff * 8.0f);
             }
-            if (adj > s_tune_adj_lim) {
-                adj = s_tune_adj_lim;
+            if (adj > ALINK_SRC_ADJ_LIMIT) {
+                adj = ALINK_SRC_ADJ_LIMIT;
             }
-            if (adj < -s_tune_adj_lim) {
-                adj = -s_tune_adj_lim;
+            if (adj < -ALINK_SRC_ADJ_LIMIT) {
+                adj = -ALINK_SRC_ADJ_LIMIT;
             }
             s_src_ratio = 65536 + adj;
         }
@@ -1645,65 +1582,7 @@ static void play_task(void *arg)
  * 回调就会重新填环，不需要任何握手。
  */
 
-/* ---------- 对外接口（供网页调参） ---------- */
-
-void alink_get_stats(alink_stats_t *out)
-{
-    if (!out) return;
-    *out = s_stats;
-    out->queue = q_depth();   /* 用瞬时值，快照是一秒前的，看波动不够新 */
-}
-
-void alink_get_tune(alink_tune_t *out)
-{
-    if (!out) return;
-    out->target_q  = s_tune_target_q;
-    out->deadband  = s_tune_deadband;
-    out->gain      = s_tune_gain;
-    out->adj_limit = s_tune_adj_lim;
-}
-
-bool alink_set_tune(const alink_tune_t *in)
-{
-    if (!in) return false;
-
-    int32_t tq = in->target_q;
-    if (tq < 8)  tq = 8;
-    if (tq > 40) tq = 40;
-
-    /* `!(x >= lo)` 而不是 `x < lo`：顺手把 NaN 也挡掉，
-     * 前端传个空字符串 atof 成 0 还好，传 "nan" 就会把控制环搞死。 */
-    float db = in->deadband;
-    if (!(db >= 0.5f)) db = 0.5f;
-    if (db > 8.0f)     db = 8.0f;
-
-    float g = in->gain;
-    if (!(g >= 1.0f)) g = 1.0f;
-    if (g > 40.0f)    g = 40.0f;
-
-    int32_t lim = in->adj_limit;
-    if (lim < 20)  lim = 20;
-    if (lim > 600) lim = 600;
-
-    const bool changed = (tq != s_tune_target_q) || (db != s_tune_deadband) ||
-                         (g != s_tune_gain)      || (lim != s_tune_adj_lim);
-
-    s_tune_target_q = tq;
-    s_tune_deadband = db;
-    s_tune_gain     = g;
-    s_tune_adj_lim  = lim;
-    return changed;
-}
-
-bool alink_rx_restart_stream(void)
-{
-    taskENTER_CRITICAL(&s_q.mux);
-    s_q.count = 0;
-    s_q.head  = 0;
-    s_q.tail  = 0;
-    taskEXIT_CRITICAL(&s_q.mux);
-    return true;
-}
+/* ---------- 启动 ---------- */
 
 void app_main(void)
 {
@@ -1755,10 +1634,6 @@ void app_main(void)
      * 几十微秒就让出，不会饿死 play。 */
     xTaskCreatePinnedToCore(rx_task,    "rx",    4096, NULL, 11, NULL, 1);
     xTaskCreatePinnedToCore(play_task,  "play",  4096, NULL, 12, NULL, 1);
-
-    /* 调参面板放在音频任务之后起：万一 httpd 起来有内存/任务失败，
-     * 也不会连累已经跑起来的播放链路。 */
-    web_ui_start();
 
     ESP_LOGI(TAG, "接收端就绪（S3 / ESP-NOW / 播放任务独占 core1），等音频包");
 }
