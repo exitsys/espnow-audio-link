@@ -464,7 +464,9 @@ static void pin_scan_run(void)
 
 static int16_t s_tail[ALINK_XFADE_FRAMES][2];   /* 上一次输出的最后 2ms */
 static bool    s_xfade;                          /* 下次输出需要淡入（2ms 接缝淡化） */
-static int     s_fade_in_left;                   /* 长淡入剩余帧数（断流恢复/时钟重配） */
+static int     s_fade_in_left;                   /* 长淡入剩余帧数（断流恢复/静音恢复/时钟重配） */
+static int     s_quiet_pkts;                     /* 连续「整包接近全零」的包数，判「从静音醒来」 */
+static uint32_t s_wake_fade;                     /* 静音恢复触发次数，供日志 */
 static int16_t s_prev[ALINK_FRAMES_PER_PKT * ALINK_CHANNELS];  /* 上一整包，PLC 外推基准 */
 static uint8_t s_plc_run;                        /* 连续 PLC 次数 */
 static uint32_t s_plc_total;                     /* 累计 PLC 次数，供日志 */
@@ -1075,8 +1077,46 @@ static void emit(const int16_t *src)
 #endif
 
     if (src) {
+        /* ---- 从静音里「醒来」的检测 ----
+         *
+         * 暂停、切歌之后，主机并不会断开流：Windows 保持端点打开，
+         * 一直送全零 PCM。所以接收端根本等不到「断流」，队列永远是满的，
+         * 上面那套 starve 判定完全不会触发 —— 而恢复的第一个非零样本
+         * 就是从 0 直接跳到某个幅度，低频上就是一声闷响。
+         *
+         * 判据用「整包几乎全零」而不是「音量小」：连钢琴最弱的尾音
+         * 也不会 240 帧全部低于 16 LSB（-66dBFS），所以正常弱奏不会被误判；
+         * 而数字静音一定是全零。连续 3 包（15ms）静音之后突然出现
+         * 峰 ≥ 64（约 -54dBFS）的内容，就认定是「重新开始放了」。
+         * 阈值不能按「好听」定高：实测 25% 系统音量下输出峰值才 168 LSB，
+         * 最早写成 1000 时一次都没触发过。 */
+        int32_t pk = 0;
+        for (int i = 0; i < ALINK_FRAMES_PER_PKT * ALINK_CHANNELS; i++) {
+            const int32_t a = (src[i] < 0) ? -(int32_t)src[i] : (int32_t)src[i];
+            if (a > pk) {
+                pk = a;
+            }
+        }
+        if (pk < 16) {
+            if (s_quiet_pkts < 1000) {
+                s_quiet_pkts++;
+            }
+        } else {
+            if (s_quiet_pkts >= 3 && pk >= 64 && s_fade_in_left == 0) {
+                s_fade_in_left = ALINK_FADE_IN_FRAMES;
+                s_wake_fade++;
+                ESP_LOGI(TAG, "从静音恢复（峰=%ld）→ 淡入 %dms",
+                         (long)pk, ALINK_FADE_IN_FRAMES * 1000 / ALINK_SAMPLE_RATE);
+            }
+            s_quiet_pkts = 0;
+        }
         memcpy(out, src, ALINK_PAYLOAD_BYTES);
     } else {
+        /* 静音包（起播前的空转、PLC 之后的补位）同样计入「安静时长」，
+         * 否则断流恢复时 s_quiet_pkts 是 0，醒来检测永远不会触发。 */
+        if (s_quiet_pkts < 1000) {
+            s_quiet_pkts++;
+        }
         memset(out, 0, ALINK_PAYLOAD_BYTES);
     }
 
@@ -1463,7 +1503,7 @@ static void rx_task(void *arg)
                     (int32_t)(s_dma_done * (uint32_t)ALINK_FRAMES_PER_PKT) -
                     (int32_t)s_out_frames;
 
-                ESP_LOGI(TAG, "包=%lu 丢=%lu(%.2f%%) 重复=%lu 补位=%lu 占位=%lu PLC=%lu 溢出=%lu 漂移丢=%lu 重采样=%+.2f%% I2S错=%lu 欠载=%lu 队列=%d(%d~%d) 输出=%.1f帧/秒 峰=%.1fdBFS RSSI=%d 跳变=%lu(边%lu/中%lu) 最大=%ld 零串=%lu帧(%lums) DMA余=%ld 相位钳=%lu",
+                ESP_LOGI(TAG, "包=%lu 丢=%lu(%.2f%%) 重复=%lu 补位=%lu 占位=%lu PLC=%lu 溢出=%lu 漂移丢=%lu 重采样=%+.2f%% I2S错=%lu 欠载=%lu 队列=%d(%d~%d) 输出=%.1f帧/秒 峰=%.1fdBFS RSSI=%d 跳变=%lu(边%lu/中%lu) 最大=%ld 零串=%lu帧(%lums) DMA余=%ld 相位钳=%lu 醒来=%lu",
                          (unsigned long)got, (unsigned long)lost,
                          got ? lost * 100.0 / (got + lost) : 0.0,
                          (unsigned long)dup, (unsigned long)pad, (unsigned long)filled,
@@ -1480,9 +1520,9 @@ static void rx_task(void *arg)
                          (unsigned long)s_zero_run_max,
                          (unsigned long)(s_zero_run_max * 1000 / ALINK_I2S_RATE),
                          (long)dma_gap,
-                         (unsigned long)s_phase_clamp);
-                s_zero_run_max = 0;      /* 每秒窗口清零，只看这一秒的最长零串 */
-                s_q_min = 1 << 20;
+                         (unsigned long)s_phase_clamp,
+                         (unsigned long)s_wake_fade);
+                s_zero_run_max = 0;      /* 每秒窗口清零，只看这一秒的最长零串 */                s_q_min = 1 << 20;
                 s_q_max = 0;
             }
             last_report = now;
