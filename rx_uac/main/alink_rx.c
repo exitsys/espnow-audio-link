@@ -601,6 +601,7 @@ static int      s_clk_fade    = 0;           /* >0 = 重配前还剩几包要淡
 static uint32_t s_rate_frames = 0;           /* 测速窗口内累计到达帧数 */
 static int64_t  s_rate_t0     = 0;           /* 测速窗口起点 */
 static int      s_rate_prev   = 0;           /* 上一窗口测出的帧率，用于去抖 */
+static uint32_t s_rate_bad0   = 0;           /* 窗口起点时的 丢包+补位 计数，变了就作废 */
 static uint32_t s_i2s_err = 0;    /* I2S 写入失败次数，非 0 就说明输出链路有问题 */
 
 /* 实际写进 I2S 的累计帧数 —— 用来直接测出「DAC 那头到底每秒收多少帧」，
@@ -1400,14 +1401,25 @@ static void rx_task(void *arg)
         int64_t now = esp_timer_get_time();
 
         /* ---- 测实际帧率，让 I2S 时钟跟上去 ----
-         * 4 秒窗口。要求连续两个窗口测出相近的值（差 < 2Hz）才动作，
-         * 避免把测量噪声当成速率偏差来回改时钟。
-         * 真正的重配由 play_task 在包边界执行（只有它能碰 I2S 通道）。 */
+         *
+         * 两个约束都是实测踩出来的：
+         *
+         * 1. **窗口必须够长**。4 秒窗口只有 800 个包，少一个包测出来就偏低
+         *    60Hz —— 实测安静时会读出 47715、47966 这种值，被当成「音源变了」
+         *    去重配时钟，而重配现在要走 30ms 淡出 + 15ms 淡入，等于凭空凹一下。
+         *    30 秒窗口把单包噪声压到 8Hz。
+         * 2. **窗口内有丢包就作废**。丢包/补位会直接拉低帧计数，测出来必然偏低。
+         *
+         * 阈值 60Hz（0.125%）：PC 的 48000.2、测量噪声都在门槛内，不动；
+         * 盒子那种 47.93k（差 70Hz）和真正的 44.1k（差 3900Hz）才动作。
+         * 真正的重配仍由 play_task 在包边界执行（只有它能碰 I2S 通道）。 */
         s_rate_frames += ALINK_FRAMES_PER_PKT;
         if (s_rate_t0 == 0) {
             s_rate_t0 = now;
-        } else if (now - s_rate_t0 >= 4000000) {
+            s_rate_bad0 = lost + filled;
+        } else if (now - s_rate_t0 >= 30000000) {
             const double span = (double)(now - s_rate_t0) / 1e6;
+            const uint32_t bad = lost + filled;
             const int target = (int)((double)s_rate_frames / span + 0.5);
             int diff = target - (int)s_i2s_rate;
             if (diff < 0) {
@@ -1417,13 +1429,14 @@ static void rx_task(void *arg)
             if (jit < 0) {
                 jit = -jit;
             }
-            if (target > 40000 && target < 52000 && diff >= 2 &&
-                s_rate_prev != 0 && jit < 2) {
+            if (bad == s_rate_bad0 && target > 40000 && target < 52000 &&
+                diff >= 60 && s_rate_prev != 0 && jit < 20) {
                 s_clk_req = target;
             }
             s_rate_prev   = target;
             s_rate_frames = 0;
             s_rate_t0     = now;
+            s_rate_bad0   = bad;
         }
 
         if (now - last_report >= 1000000) {
