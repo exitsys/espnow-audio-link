@@ -20,18 +20,19 @@
  * 想严格复刻 C3 的单核行为做反向对照：把 app_main 里 play 任务的
  * xTaskCreatePinnedToCore 换回 xTaskCreate 即可。
  *
- * ---- 以下是 C3 版的原始说明，链路逻辑完全一致 ----
- * 连发送端的热点 → 发 HELLO 报备 → 收音频包进抖动缓冲 → I2S 输出到 PCM5102A。
+ * ---- 以下是 C3 版的原始说明。传输层后来从 UDP 换成了 ESP-NOW（不再连热点、
+ *      不发 HELLO），下面四条播放侧的对策一直沿用 ----
+ * 收音频包进抖动缓冲 → I2S 输出到 PCM5102A。
  *
- * 2026-11-18 重写播放侧，解决实测的「连接不稳 + 爆音」。三个根因：
+ * 2026-11-18 重写播放侧，解决实测的「连接不稳 + 爆音」。四个根因：
  *
- *   1. 时钟漂移：TX 的 32kHz 来自 S3 晶振，RX 的 32kHz 来自 C3 的 I2S 分频，
- *      两者差 20~50ppm，队列必然缓慢溢出或见底。
- *      → 水位闭环：EMA 跟队列深度，偏了就丢一包 / 补一包静音。
+ *   1. 时钟漂移：收发两端晶振差 20~50ppm，队列必然缓慢溢出或见底。
+ *      → 水位闭环：EMA 跟队列深度。最初是「偏了就丢一包 / 补一包静音」，
+ *        之后两次升级：先是每包插删 1 帧，最终改成连续分数重采样（见 src_process）。
  *
  *   2. 抽空后 DMA 循环播旧数据：auto_clear_after_cb 是 false，DMA 会一直重复
  *      最后一包内容，听感是「哒哒哒」。
- *      → I2S 时钟永不断流，没数据就写静音包；DMA 深度收到 20ms。
+ *      → I2S 时钟永不断流，没数据就写静音包；DMA 深度保持在 15~20ms。
  *
  *   3. 丢包直接跳过 5ms：波形阶跃，每丢一包一声「咔」。
  *      → 按 seq 空洞补占位包，时序不错位。
@@ -40,8 +41,8 @@
  *      → PLC：重复上一包输出并逐次衰减（×1.0/0.6/0.35/0.2，第 5 次归零），
  *        相位不连续由 emit() 的 2ms 交叉淡化抹平。
  *
- * 另外 TX 现在每包背靠背发两份，这里按 seq 去重（diff == 0 的丢掉）。
- * 双发和 PLC 是两层独立保险：双发挡住单次事件，PLC 兜住双发也救不回来的情况。
+ * TX 每包只发一份，没有冗余副本，PLC 是丢包的唯一兜底。
+ * seq 不比上一包新的包（迟到重到的旧包）只做去重。
  *
  * 所有断点（起播 / 丢包 / 补包 / 断流）统一走 2ms 交叉淡化，不再有阶跃。
  */
@@ -81,17 +82,17 @@ static const char *TAG = "alink_rx";
 /* 仅在 ALINK_I2S_USE_MCLK=1 时使用，接 DAC 的 SCK（替代接地） */
 #define PIN_MCLK   GPIO_NUM_13
 
-/* 播放侧采样率 48kHz，时钟源 PLL_160M —— 与 C3 完全一致。
+/* 播放侧采样率 48kHz。时钟源由下面的 ALINK_I2S_CLK_240M 决定，当前取 PLL_240M。
  *
- * 这里要澄清一个曾经的误判：一度怀疑 C3 因为没有 APLL 而产生 pattern jitter。
- * 实际算一遍：160e6 / (48000×64) = 52 + 1/12，小数分母 12 在分频器上限 63
- * 以内，能精确表达，不产生周期性补偿。S3 的 I2S 硬件上同样没有 APLL 通道
- * （只有 XTAL / PLL_160M / PLL_240M / EXTERNAL），所以这一项两者等价，
+ * 这里要澄清一个曾经的误判：从 C3 移植时一度怀疑 C3 因为没有 APLL 而产生
+ * pattern jitter。实际算一遍：160e6 / (48000×64) = 52 + 1/12，小数分母 12 在
+ * 分频器上限 63 以内，能精确表达，不产生周期性补偿。S3 的 I2S 硬件上同样没有
+ * APLL 通道（只有 XTAL / PLL_160M / PLL_240M / EXTERNAL），所以这一项两者等价，
  * **不是噼啪的差异来源**。
  *
- * 与盒子的残余失配（盒子约 47.93k vs 本地 48k，约 0.15%）仍由水位闭环的
- * 连续分数重采样吸收。复核方法：看 RX 日志里「欠载」「漂移丢」「重采样」
- * 三个数是否还在缓慢增长。 */
+ * 与盒子的残余失配（盒子约 47.93k vs 本地 48k，约 0.15%）分两级消化：
+ * I2S 时钟跟随音源做粗调（见 rx_task 的测速窗口），水位闭环的连续分数重采样做细调。
+ * 复核方法：看 RX 日志里「欠载」「漂移丢」「重采样」三个数是否还在缓慢增长。 */
 #ifndef ALINK_I2S_RATE
 #define ALINK_I2S_RATE 48000
 #endif
@@ -113,7 +114,8 @@ static const char *TAG = "alink_rx";
 /* I2S 主时钟源
  *
  * 1 = PLL_240M：12.288MHz 得到 19 + 34/64 的整数分频，BCK 零周期抖动
- * 0 = PLL_160M：默认值，13 + 1/64，每 64 个周期插一个补偿周期 = 192kHz 抖动
+ * 0 = PLL_160M：移植时的初始值（为了和 C3 条件一致），13 + 1/64，每 64 个周期
+ *     插一个补偿周期 = 192kHz 抖动
  *
  * 48000×256 = 12.288MHz，而 I2S 小节分频器分母上限是 64。
  * 160/12.288 = 13.0208333（小数 1.3333/64，除不尽）
@@ -144,13 +146,12 @@ static const char *TAG = "alink_rx";
 #define ALINK_PIN_SCAN 0
 #endif
 
-/* DMA 深度直接决定「用户看不见的额外延迟」：
- * i2s_channel_write 只要 DMA 有空位就立刻返回，所以队列里的包会被迅速灌进
- * DMA，队列深度本身不代表真实缓冲。4 × 160 帧 @32k = 20ms，够吸收 WiFi 抖动，
- * 又不至于把延迟撑到蓝牙的水平。 */
-/* DMA 深度直接进端到端延时：dma_desc_num × dma_frame_num / fs。
- * 4×5ms = 20ms 是稳定档；低延时档 3×5ms = 15ms。
- * 减到 2 会只剩 10ms，play_task 被抢占 8ms 就硬件空转，不划算。 */
+/* DMA 深度直接决定「用户看不见的额外延迟」：i2s_channel_write 只要 DMA 有空位就
+ * 立刻返回，所以队列里的包会被迅速灌进 DMA，队列深度本身不代表真实缓冲。
+ * 延时 = dma_desc_num × dma_frame_num / fs（dma_frame_num = 240 帧 @48k = 5ms）：
+ *   稳定档 4 × 5ms = 20ms，够吸收 WiFi 抖动，又不至于把延迟撑到蓝牙的水平；
+ *   低延时档 3 × 5ms = 15ms。
+ *   减到 2 会只剩 10ms，play_task 被抢占 8ms 就硬件空转，不划算。 */
 #if ALINK_LOW_LATENCY
 #define I2S_DMA_DESC   3
 #else
@@ -164,8 +165,15 @@ static i2s_chan_handle_t s_i2s_tx;
 static RingbufHandle_t s_rb;
 static volatile int s_peer_rssi = 0;     /* 最近一包的信噪，仅用于日志 */
 
-/* 最近一次收到音频包的时刻（us），只用于统计与日志 */
-static volatile int64_t s_last_rx_us = 0;
+/* 发送方白名单：menuconfig 里配了发射端 MAC（CONFIG_ALINK_TX_MAC）才启用，
+ * 留空时 s_filter_tx 恒为 false，行为和不设白名单时完全一致。
+ * ESP-NOW 不加密，同信道上任何设备都能往这块板的地址发帧；有了它，别的设备
+ * 发来的帧进不了环形缓冲。解析规则见 alink_common.h 的 alink_mac_from_str。 */
+#ifndef CONFIG_ALINK_TX_MAC
+#define CONFIG_ALINK_TX_MAC ""      /* 还没跑过 menuconfig 的 sdkconfig：不校验发送方 */
+#endif
+static uint8_t s_peer_tx[ALINK_ETH_ALEN];
+static bool    s_filter_tx = false;
 
 /* ---------- 抖动缓冲：单生产者（收包）单消费者（播放） ---------- */
 
@@ -258,7 +266,7 @@ static bool q_pop(uint8_t *out, bool *is_fill)
     taskEXIT_CRITICAL(&s_q.mux);
 
     if (ok) {
-        /* 生产者要绕满 24 个槽才会回到 i，这里 memcpy 早已结束，不会踩 */
+        /* 生产者要绕满 ALINK_Q_DEPTH 个槽才会回到 i，这里 memcpy 早已结束，不会踩 */
         memcpy(out, s_q.data[i], ALINK_PAYLOAD_BYTES);
     }
     return ok;
@@ -462,6 +470,11 @@ static void pin_scan_run(void)
 
 /* ---------- 输出：所有不连续点都在这里抹平 ---------- */
 
+/* 「从静音醒来」的判定长度（包）：连续这么多包整包低于 16 LSB 才算数字静音。
+ * 3 包 = 15ms。src_process 的相位吸附也以它为准（见 emit），两处必须用同一个数：
+ * 吸附之后紧跟的有声包，一定要落在 15ms 淡入里。 */
+#define ALINK_WAKE_QUIET_PKTS 3
+
 static int16_t s_tail[ALINK_XFADE_FRAMES][2];   /* 上一次输出的最后 2ms */
 static bool    s_xfade;                          /* 下次输出需要淡入（2ms 接缝淡化） */
 static int     s_fade_in_left;                   /* 长淡入剩余帧数（断流恢复/静音恢复/时钟重配） */
@@ -549,6 +562,15 @@ static inline int32_t dither_tpdf(void)
  * 两档统一用 3.0，延时靠 TARGET_Q 和 DMA 降，不靠砍死区。 */
 #define ALINK_SRC_DEADBAND  3.0f
 
+/* 起播门槛：队列攒到「稳态水位」才开始播。稳态水位 = 目标 − 死区（见 play_task
+ * 和 TUNING.md 的坑 3），所以直接由这两个量算出来，不单独调。
+ *
+ * 原来是固定 6 包（30ms），离稳态的 15 包太远。起播后靠 P 控制补水很慢：
+ * 6 包时约每秒 0.2 包，越接近目标越慢，要 40~60 秒才回到 15 包 —— 这段时间
+ * 抗 WiFi 抖动的余量只有一半，而断流恢复、TX 重启之后都会走这条路。
+ * 门槛提到稳态水位的代价是每次起播多 45ms 静音。 */
+#define ALINK_JITTER_PKTS (ALINK_TARGET_Q - (int)ALINK_SRC_DEADBAND)
+
 /* polyphase windowed-sinc 插值器参数。
  *
  * 为什么不用 4 点三次 Hermite：上电自测（ALINK_SRC_DIAG）实测，
@@ -557,12 +579,12 @@ static inline int32_t dither_tpdf(void)
  * 而分数相位每 5ms 扫一遍，等于每秒 200 次的幅度调制，
  * 听感就是「调频干扰」。8kHz 也有 0.55dB 的增益损失和 -52dB 谐波。
  *
- * 16 抽头 Kaiser 窗 sinc（β=8）把同条件失真压到 -70dB 以下，
- * 高频增益平坦到 0.1dB，代价是每样本 16 次乘加 + 8 帧历史。 */
-/* 16 抽头 Kaiser 窗 sinc（β=8）：过渡带约 Fs/16 = 3kHz 宽，也就意味着
- * 从 21kHz 往下 3kHz（即 18kHz）就开始滚降，15kHz 已经在坡上。
- * 32 抽头把过渡带收到 Fs/32 = 1.5kHz（16.5kHz 才起滚），15kHz 落在通带内
- * 平坦区。代价是每样本 32 次乘加 + 16 帧历史。 */
+ * 先换成 16 抽头 Kaiser 窗 sinc（β=8）：同条件失真压到 -70dB 以下、高频增益
+ * 平坦到 0.1dB。但 16 抽头的过渡带约 Fs/16 = 3kHz 宽，也就意味着从 21kHz 往下
+ * 3kHz（即 18kHz）就开始滚降，15kHz 已经在坡上。
+ *
+ * 最终用 32 抽头：过渡带收到约 Fs/32 = 1.5kHz（16.5kHz 才起滚），15kHz 落在
+ * 通带内平坦区。代价是每样本 32 次乘加 + 16 帧历史。 */
 #define SRC_TAPS    32
 #define SRC_HALF    (SRC_TAPS / 2)           /* 16：尾镜像帧数 */
 #define SRC_PHASES  512                      /* 相位分辨率，表项间再做线性插值 */
@@ -583,6 +605,7 @@ static int32_t s_src_phase = 65536;          /* Q16，原点 = 上一包最后�
 static int32_t s_src_ratio = 65536;          /* Q16，1.0 = 直通 */
 static int16_t s_src_hist[SRC_TAPS][ALINK_CHANNELS]; /* 上一包的最后 SRC_TAPS 帧 */
 static uint32_t s_phase_clamp = 0;           /* 相位钳位次数（应为 0；非 0 = 有硬跳变） */
+static bool s_src_snap_ok = false;           /* 本包处于数字静音：结束时允许把相位吸附到整帧（见 emit） */
 
 /* I2S 播放率跟随音源。
  *
@@ -706,10 +729,10 @@ static inline void jump_check_block(const int16_t (*blk)[ALINK_CHANNELS], int nf
 }
 
 /* ---------- polyphase windowed-sinc 插值核 ----------
- * 上电时算一次：512 个相位 × 16 抽头，Kaiser 窗 β=8。
+ * 上电时算一次：512 个相位 × 32 抽头（SRC_TAPS），Kaiser 窗 β=8。
  * 每行系数归一化到和为 1（DC 增益恒为 1），再压成 Q15 定点。
  *
- * 16 抽头的过渡带约 Fs/16 = 3kHz，15kHz 仍在通带内、增益平坦，
+ * 32 抽头的过渡带约 1.5kHz，15kHz 仍在通带内、增益平坦，
  * 阻带衰减 -80dB 以上 —— 正是为了压掉 4 点 Hermite 那 -44dB 的谐波。 */
 static double bessel_i0(double x)
 {
@@ -737,7 +760,7 @@ static void sinc_init(void)
         double sum = 0.0;
 
         for (int k = 0; k < SRC_TAPS; k++) {
-            /* 抽头中心在 k = SRC_HALF-1 = 7，对应 buf[i] */
+            /* 抽头中心在 k = SRC_HALF-1（32 抽头时是 15），对应 buf[i] */
             const double x = (double)(k - (SRC_HALF - 1)) - d;
             const double s = (fabs(x) < 1e-9) ? 1.0 : sin(M_PI * x) / (M_PI * x);
             const double r = x / (double)SRC_HALF;
@@ -758,7 +781,7 @@ static void sinc_init(void)
 /* 把本包 n 帧（已在 out 里）做连续分数重采样，结果写回 out。
  * 返回输出帧数（通常 239~242）。
  *
- * 插值核是 16 抽头 windowed sinc，不是多项式：
+ * 插值核是 32 抽头 windowed sinc（SRC_TAPS），不是多项式：
  * 4 点三次 Hermite 在高频的增益随分数相位剧烈摆动（实测 15kHz 掉 3dB、
  * 2f 谐波 -44dB），而分数相位每 5ms 扫一遍，等于每秒 200 次幅度调制，
  * 听感正是「调频干扰」。sinc 核把同条件失真压到 -70dB 以下。
@@ -814,7 +837,7 @@ static int src_process(int16_t *out, int n, bool reset, const int16_t *next)
         const int32_t f = s_src_phase & 0xFFFF;
 
         if (f == 0) {
-            /* 恰好落在整数帧上，直接取，省掉 3 次 64 位乘 */
+            /* 恰好落在整数帧上，直接取，省掉 32 次乘加 */
             out[nout * ALINK_CHANNELS]     = buf[i][0];
             out[nout * ALINK_CHANNELS + 1] = buf[i][1];
         } else {
@@ -865,15 +888,34 @@ static int src_process(int16_t *out, int n, bool reset, const int16_t *next)
         }
     }
 
-    /* ratio 精确为 1 时，把不足 0.1 帧的相位残差吸附到整帧。
-     * 这一包之后所有采样点都落在整数帧上（走 f == 0 分支），彻底不再插值。
-     * 吸附量 ≤ 0.1 帧 ≈ 2µs，一次性事件，不可闻。负相位不吸附（下标含义已变）。 */
+    /* ratio 精确为 1 时，把相位残差吸附到整帧。吸附之后所有采样点都落在整数帧上
+     * （走 f == 0 分支），彻底不再插值。
+     *
+     * 吸附等于把时间轴一次性挪动，所以允许挪多少取决于当时有没有声：
+     *
+     *   有声：只允许挪不足 0.1 帧（≈2µs）。这个量级是一次性事件，听不出来。
+     *         两个方向都吸附 —— ratio 小于 1 时残差通常是「差一点点到下一个整数帧」，
+     *         只向下吸附的话这种情况会一直留着。
+     *   静音：挪多少都无所谓，吸附到最近的整数帧。要求已经连续
+     *         ALINK_WAKE_QUIET_PKTS 包数字静音，紧跟而来的有声包一定落在 15ms 淡入里。
+     *         挪 0.5 帧对有声内容是几百 LSB 的单点误差，所以不在有声时做。
+     *
+     * 原来只有「残差不足 0.1 帧才向下吸附」一条。开机收敛那几十秒积累的小数相位
+     * 远超 0.1 帧，于是收敛完基本都停在某个固定的小数相位上 —— 日志里 ratio 是
+     * 0.00%，实际每个样本仍在走 32 抽头插值，「零插值直通」并没有发生。 */
     if (s_src_ratio == 65536 && s_src_phase >= 0) {
         const int32_t rem = s_src_phase & 0xFFFF;
-        if (rem != 0 && rem < 6554) {
-            s_src_phase -= rem;
+        if (rem != 0) {
+            if (s_src_snap_ok) {
+                s_src_phase += (rem >= 32768) ? (65536 - rem) : -rem;
+            } else if (rem < 6554) {
+                s_src_phase -= rem;
+            } else if (rem >= 65536 - 6554) {
+                s_src_phase += 65536 - rem;
+            }
         }
     }
+    s_src_snap_ok = false;
 
     /* 历史 = 本包最后 SRC_TAPS 帧（要求 n >= SRC_TAPS，payload 240 帧满足） */
     memcpy(s_src_hist, &buf[SRC_BASE + n - SRC_TAPS][0], sizeof(s_src_hist));
@@ -1102,7 +1144,7 @@ static void emit(const int16_t *src)
                 s_quiet_pkts++;
             }
         } else {
-            if (s_quiet_pkts >= 3 && pk >= 64 && s_fade_in_left == 0) {
+            if (s_quiet_pkts >= ALINK_WAKE_QUIET_PKTS && pk >= 64 && s_fade_in_left == 0) {
                 s_fade_in_left = ALINK_FADE_IN_FRAMES;
                 s_wake_fade++;
                 ESP_LOGI(TAG, "从静音恢复（峰=%ld）→ 淡入 %dms",
@@ -1126,6 +1168,8 @@ static void emit(const int16_t *src)
         const bool reset = s_xfade;      /* 断点恢复时相位归零，避免历史帧错位 */
         int16_t nxt[SRC_HALF * ALINK_CHANNELS];
         const int16_t *pnext = q_peek(nxt, SRC_HALF) ? nxt : NULL;
+        /* 已经连续几包数字静音：这一包结束后允许把相位吸附到整帧（见 src_process） */
+        s_src_snap_ok = (s_quiet_pkts >= ALINK_WAKE_QUIET_PKTS);
         nout = src_process(out, n, reset, pnext);
     }
 
@@ -1158,9 +1202,9 @@ static void emit(const int16_t *src)
     }
 
     /* 固定电平校准 + 抖动。
-     * 本版沿用老哥的设计，没有实现 UAC 音量（set_volume_cb 只打日志），
-     * 而 PCM5102A 满刻度是 2.1Vrms，对有源音箱是 12~20dB 的结构性过载。
-     * 在写 I2S 前统一压一层，避免「开一点就很大」。改 ALINK_OUT_ATTEN_DB 可调。
+     * 主机的音量已经在 TX 侧作用到样本上（见 alink_tx.c 的 uac_volume_cb），
+     * 这里是叠在它上面的一层固定衰减：PCM5102A 满刻度是 2.1Vrms，对有源音箱是
+     * 12~20dB 的结构性过载，不压一层就是「开一点就很大」。改 ALINK_OUT_ATTEN_DB 可调。
      *
      * 乘法必须带舍入：原来直接 >>16 是截断，误差恒为负，变成与信号相关的
      * 失真（有声时才听得出来，像轻微噼啪）。再加 TPDF 抖动把残余量化误差
@@ -1217,7 +1261,7 @@ static void emit(const int16_t *src)
      * 而且所有软件指标全绿，根本查不到。
      *
      * 修法：应用层先攒够 240 帧再写，每次写严格 960 字节。
-     * 代价是最多 5ms 额外延迟（队列有 9 包 ≈ 45ms 缓冲，无所谓）。 */
+     * 代价是最多 5ms 额外延迟（队列稳态 15 包 ≈ 75ms 缓冲，无所谓）。 */
     static int16_t acc[ALINK_FRAMES_PER_PKT * 2 + 32][ALINK_CHANNELS];
     static int acc_n = 0;
     memcpy(&acc[acc_n][0], out, (size_t)nout * ALINK_CHANNELS * sizeof(int16_t));
@@ -1315,6 +1359,10 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     if (len < (int)(ALINK_HDR_SIZE + ALINK_PAYLOAD_BYTES)) {
         return;
     }
+    /* 配了发送方白名单就只认它。只比较 6 个字节，在 WiFi 任务里做得起。 */
+    if (s_filter_tx && (!info || memcmp(info->src_addr, s_peer_tx, ALINK_ETH_ALEN) != 0)) {
+        return;
+    }
     if (info && info->rx_ctrl) {
         s_peer_rssi = info->rx_ctrl->rssi;
     }
@@ -1359,10 +1407,26 @@ static void wifi_espnow_init(void)
     if (r != ESP_OK) ESP_LOGW(TAG, "config_espnow_rate: %s", esp_err_to_name(r));
 #pragma GCC diagnostic pop
 
+    /* 发送方白名单（menuconfig → Component config → Audio link → 发射端 MAC 地址）。
+     * 留空 = 不校验，和没有这个选项时的行为一致。
+     * 填了但格式非法时不启用，并且大声报出来：白名单是可选的加固，
+     * 不该因为一个拼写错误让整机没声音。 */
+    s_filter_tx = (CONFIG_ALINK_TX_MAC[0] != '\0') &&
+                  alink_mac_from_str(CONFIG_ALINK_TX_MAC, s_peer_tx);
+    if (CONFIG_ALINK_TX_MAC[0] != '\0' && !s_filter_tx) {
+        ESP_LOGE(TAG, "CONFIG_ALINK_TX_MAC=\"%s\" 格式非法，本次不校验发送方",
+                 CONFIG_ALINK_TX_MAC);
+    }
+
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    ESP_LOGW(TAG, "ESP-NOW 就绪：本机 " MACSTR " 信道 %d，等发送端的单播包",
-             MAC2STR(mac), ALINK_WIFI_CHANNEL);
+    if (s_filter_tx) {
+        ESP_LOGW(TAG, "ESP-NOW 就绪：本机 " MACSTR " 信道 %d，只收 " MACSTR " 的单播包",
+                 MAC2STR(mac), ALINK_WIFI_CHANNEL, MAC2STR(s_peer_tx));
+    } else {
+        ESP_LOGW(TAG, "ESP-NOW 就绪：本机 " MACSTR " 信道 %d，等发送端的单播包（不校验发送方）",
+                 MAC2STR(mac), ALINK_WIFI_CHANNEL);
+    }
 }
 
 /* ---------- 收包 ---------- */
@@ -1402,8 +1466,8 @@ static void rx_task(void *arg)
         }
 
         if (have_last) {
-            /* 用 int16 差值：seq 回绕时比较仍然正确，也能区分「重复」和「空洞」。
-             * TX 双发时第二份的 seq 与上一包相同，diff == 0。 */
+            /* 用 int16 差值：seq 回绕时比较仍然正确，也能区分「旧包」和「空洞」。
+             * 迟到重到的包 seq 不比上一包新，diff <= 0，直接丢掉。 */
             int16_t diff = (int16_t)(h->seq - last_seq);
 
             if (diff < -100) {
@@ -1436,24 +1500,34 @@ static void rx_task(void *arg)
             overrun++;   /* 队列满：说明 RX 消费不过来，水位闭环会慢慢把它压下去 */
         }
         got++;
-        s_last_rx_us = esp_timer_get_time();
 
         int64_t now = esp_timer_get_time();
 
         /* ---- 测实际帧率，让 I2S 时钟跟上去 ----
          *
-         * 两个约束都是实测踩出来的：
+         * 前两个约束是实测踩出来的：
          *
          * 1. **窗口必须够长**。4 秒窗口只有 800 个包，少一个包测出来就偏低
          *    60Hz —— 实测安静时会读出 47715、47966 这种值，被当成「音源变了」
          *    去重配时钟，而重配现在要走 30ms 淡出 + 15ms 淡入，等于凭空凹一下。
          *    30 秒窗口把单包噪声压到 8Hz。
          * 2. **窗口内有丢包就作废**。丢包/补位会直接拉低帧计数，测出来必然偏低。
+         * 3. **TX 的补位包不算数**。补位包是 TX 按自己的定时器发的，节奏是 TX 晶振的
+         *    200 包/秒，不代表主机帧率。不排除的话，静音期间测出来的「音源帧率」其实是
+         *    TX 的发包率：对 47.93k 的盒子，每次暂停后 I2S 会被拉回 48000，恢复播放
+         *    30~60 秒后再拉回去 —— 那次 30ms 淡出加 15ms 淡入正好落在音乐中间。
+         *    所以一见到补位包，窗口就清零重来。
          *
          * 阈值 60Hz（0.125%）：PC 的 48000.2、测量噪声都在门槛内，不动；
-         * 盒子那种 47.93k（差 70Hz）和真正的 44.1k（差 3900Hz）才动作。
+         * 盒子那种 47.93k（差 70Hz）才动作。
          * 真正的重配仍由 play_task 在包边界执行（只有它能碰 I2S 通道）。 */
-        s_rate_frames += ALINK_FRAMES_PER_PKT;
+        if (h->flags & ALINK_FLAG_PAD) {
+            s_rate_frames = 0;
+            s_rate_t0     = now;
+            s_rate_bad0   = lost + filled;
+            s_rate_prev   = 0;      /* 作废的窗口不拿去和下一个窗口比抖动 */
+        }
+        s_rate_frames += (h->flags & ALINK_FLAG_PAD) ? 0 : ALINK_FRAMES_PER_PKT;
         if (s_rate_t0 == 0) {
             s_rate_t0 = now;
             s_rate_bad0 = lost + filled;
@@ -1593,16 +1667,19 @@ static void play_task(void *arg)
         ema = ema * 0.95f + (float)d * 0.05f;
 
         if (!started) {
+            /* 门槛 = 目标水位 − 死区，也就是闭环的稳态水位（见 ALINK_JITTER_PKTS）。
+             * 从这个水位起播，闭环一开始就落在死区里，不用再花几十秒把水补上来。 */
             if (d >= ALINK_JITTER_PKTS) {
                 started = true;
                 starve = 0;
-                /* EMA 必须从当前水位起步。从 0 冷启动的话，前几百毫秒 ema 都
-                 * 低于 ALINK_Q_LOW，会被误判成「RX 偏快」，一路补静音把队列抽干。 */
+                /* EMA 必须从当前水位起步。从 0 冷启动的话，头几百毫秒 ema 都在目标
+                 * 之下，闭环会先把重采样比压到 1 以下，平白多出一段插值。 */
                 ema = (float)d;
                 s_xfade = true;
                 ESP_LOGI(TAG, "起播 队列=%d", d);
             } else {
-                emit(NULL);          /* 保持 I2S 时钟连续，不写静音就会循环播旧数据 */
+                /* 预缓冲期间照常写静音，保持 I2S 时钟连续 —— 不写就会循环播旧数据 */
+                emit(NULL);
                 continue;
             }
         }
@@ -1665,7 +1742,7 @@ static void play_task(void *arg)
                 emit((const int16_t *)pcm);
             }
         } else {
-            /* 断流：DMA 里还有 20ms 余量，这里接 PLC，不产生爆音 */
+            /* 断流：DMA 里还有 I2S_DMA_DESC × 5ms 的余量，这里接 PLC，不产生爆音 */
             s_underrun++;
             emit_plc();
             if (++starve == ALINK_STARVE_RESET) {

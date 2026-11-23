@@ -3,14 +3,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# 音频包 5ms 一个，用户层稍被抢占就要丢包。默认 UDP recvmbox 只有 6 个位置，
-# 撑不住 30ms 的调度延迟。32 个位置 = 160ms 余量。
-CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
-CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
-
 # 注：ESP32-S3 的 I2S 时钟源只有 XTAL / PLL_160M / PLL_240M / EXTERNAL，
 # 硬件上并没有把 APLL 接到 I2S（那是 ESP32 / ESP32-S2 / ESP32-P4 才有的）。
-# 所以这里不做特殊配置，保持 PLL_160M —— 与 C3 完全一致，保证单变量对照。
+# 时钟源不在这里配，由 rx_uac/main/alink_rx.c 的 ALINK_I2S_CLK_240M 选，
+# 当前是 PLL_240M（12.288MHz 可以整数分频，BCK 没有周期性抖动；原因见那一段注释）。
 #
 # 顺带澄清一个曾经的误判：160MHz / 3.072MHz = 52 + 1/12，分母 12 ≤ 63，
 # IDF 的小数分频器能精确表达，本身不产生 pattern jitter。

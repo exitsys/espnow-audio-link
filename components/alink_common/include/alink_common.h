@@ -12,7 +12,10 @@
  */
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define ALINK_MAGIC            0x4B4E4C41u   /* "ALNK" */
 
@@ -33,80 +36,46 @@
 #define ALINK_FRAMES_PER_PKT   (ALINK_SAMPLE_RATE * ALINK_PKT_MS / 1000)   /* 240 */
 #define ALINK_PAYLOAD_BYTES    (ALINK_FRAMES_PER_PKT * ALINK_FRAME_BYTES)  /* 960 */
 
-/* 网络 */
-#define ALINK_WIFI_SSID        "alink-audio"
-#define ALINK_WIFI_PASS        "********"
+/* 网络：ESP-NOW 单播，不开热点、不用 IP，两端只要钉在同一个信道上 */
 #define ALINK_WIFI_CHANNEL     11
-#define ALINK_UDP_PORT         33333
-#define ALINK_AP_IP            "192.168.4.1"
 
-/* 接收端起播前先攒几包。6 包 = 30ms。
- * 这是「起播门槛」，不是「持续水位」。 */
-#define ALINK_JITTER_PKTS      6
+/* 起播门槛（起播前先攒几包）定义在 rx_uac/main/alink_rx.c —— 它必须跟死区绑定，
+ * 所以不和这里的两端共用参数放在一起。 */
 
 /* ---------- 水位闭环（时钟漂移补偿） ----------
- * TX 的 48k 采样节拍来自电视盒子的 USB 时钟，RX 的 48k 来自 C3 的 I2S 分频。
- * 实测盒子送 191703 B/s ≈ 47926Hz，RX 播 48000Hz，差 74 帧/秒（0.15%）。
  *
- * 2026-11-19 改法：细调不再用「整包丢/补」。
- * 整包丢就是 5ms 突变，即使配 2ms 交叉淡化，每秒来几次也会听成"噼啪"
- * （实测：丢包 0.02%、PLC 仍每秒约 1 次，噼啪还在）。
- * 改成样本级滑移：每包最多插入/删除 1 帧（1/240 = 0.42%，调节能力 200 帧/秒，
- * 远超 74 帧/秒的失配），用线性插值，听感上无痕。
- * 整包丢弃只在真溢出时保留，做粗调兜底。
+ * TX 的 48k 节拍来自主机的 USB 时钟，RX 的 48k 来自本地 I2S 分频，两边晶振
+ * 必然差几十 ppm；主机本身也未必是精确的 48k（实测盒子 47.93k，PC 48000.2）。
+ * 差额全部在接收端消化，分两级：
  *
- * 同时把水位从 6 包抬到 10 包：30ms 缓冲太浅，WiFi 一抖动就见底。
+ *   粗：I2S 时钟跟随音源 —— 30 秒窗口测实际帧率，差 60Hz 以上才重配；
+ *   细：队列水位做 EMA，偏离目标超过 ±死区（ALINK_SRC_DEADBAND）就给重采样比
+ *       加一个小偏置（P 控制，增益 8，上限 ±0.3%）。死区之内 ratio 精确等于 1.0，
+ *       一个样本都不插值 —— 这是音质底线，别为了省延时砍死区。
  *
- * 2026-11-21 再调：实测队列在 1~24 之间来回摆（容量就 24），两头都撞墙 ——
- * 触底是欠载走 PLC，撞顶是 overrun 丢掉整包，两个都是「咔」。
- * 病根是闭环增益：原来 dev × 64，队列偏 10 包就直接打满 ±0.8%，
- * 而实际收发时钟差只有 0.01%（5.5 帧/秒），等于用 80 倍的力去推一个微调，
- * 必然过冲 → 反向过冲。现在：
- *   缓冲 24→48 包（240ms），目标 10→20 包，让控制环有腾挪空间；
- *   增益 64→8，上限 0.8%→0.3%，从「猛推到饱和」改成「缓慢收敛」。
+ * 调 TARGET_Q / 死区 / 增益之前先算一遍这条稳态方程（P 控制没有积分项）：
  *
- * 目标水位定 26 而不是 20：这是 P 控制的稳态误差，不是随便填的。
- * 实测收发失配约 0.04%，闭环要输出对应的调整量才有平衡，
- * 而 adj = (|dev|-3)×8，解出来 |dev|≈6 —— 目标定 20 就会真的稳在 14，
- * 白扔 30ms 缓冲。定 26 恰好让平衡点落在 20 包（100ms），
- * 留足抗 WiFi 突发空档的余量。
+ *     稳态水位 = TARGET_Q − 死区 − (收发失配 × 65536) / 增益
  *
- * ---------- 2026-11-21 加低延时档（看视频，要音画同步） ----------
+ * 盒子的失配 0.146% 在增益 8 下要占掉 12 包，PC 的 0.037% 只占 3 包。
+ * 所以同一个 TARGET_Q，接 PC 的水位会比接盒子高约 9 包，这是正常现象，不是 bug。
+ * 盒子在开机头 60 秒里粗调还没生效（要两个干净的 30 秒窗口），水位会直接落到
+ * 方程给出的那个数上 —— TARGET_Q 调低之前先确认那个数离欠载还够远。
  *
- * 端到端延时基本等于「队列水深 + DMA 深度」，其余各段合计不到 10ms。
- * 接安卓盒子看电视时，声音晚 100ms 就是明显的口型不同步，所以开了这个档：
- * 目标 26→14、增益 8→16、DMA 4→3，设备链路 103ms → 63ms。
- *
- * ⚠ 三项必须一起改，缺一不可，原因是 P 控制的那条稳态方程：
- *
- *     稳态时 |dev| = 需要的 adj / 增益
- *
- *   盒子的失配是 **0.146%**（实测送 47.93k，本地 48k），不是 PC 的 0.037%。
- *   要输出 adj = -96 才补得上：
- *     · 增益还是 8 → 需要 |dev| = 12，目标定 14 就只剩 2 包 → 直接欠载
- *     · 增益提到 16 → 需要 |dev| = 6，稳态落在 8 包（40ms），刚好
- *
- *   所以「只把 TARGET_Q 调小」在 PC 上看着没事，一接盒子必崩。
- *   反过来说，PC 上测出来的水位会比盒子上高 4~5 包，这是正常现象，别当成 bug。
- *
- * DMA 从 4 减到 3：15ms 的硬件缓冲。play_task 在 core1 优先级 12，
- * 写满 3 个描述符要 10ms 内被调度到，压力比 4 描述符大，但余量仍在。
- */
+ * 演进过程和实测数据见 TUNING.md。 */
 #ifndef ALINK_LOW_LATENCY
 #define ALINK_LOW_LATENCY      1
 #endif
 
 #if ALINK_LOW_LATENCY
-#define ALINK_TARGET_Q         18    /* 低延时档：死区 3.0 → 稳态 15~21 包，均值 90ms */
+#define ALINK_TARGET_Q         18    /* 低延时档。时钟跟随生效后稳态在 TARGET − 死区 = 15 包 = 75ms */
 #define ALINK_Q_HIGH           32    /* 真溢出兜底：EMA 高于此值且瞬时也高 → 丢整包 */
 #else
-#define ALINK_TARGET_Q         26    /* 稳定档：接盒子时实际稳在 11 包 = 55ms */
+#define ALINK_TARGET_Q         26    /* 稳定档。接盒子时实测稳在 11 包 = 55ms（见上面的稳态方程） */
 #define ALINK_Q_HIGH           40
 #endif
-#define ALINK_Q_LOW            8     /* 保留定义，细调由 ema ± ALINK_SRC_DEADBAND 判定 */
 #define ALINK_Q_DEPTH          48    /* 环形队列容量（包）= 240ms */
-#define ALINK_DRIFT_DEADBAND   2     /* 队列偏离目标超过这么多包，才启动样本级滑移 */
-#define ALINK_MAX_FILL         4     /* 单次丢包最多补几包静音，防连环补包 */
+#define ALINK_MAX_FILL         4     /* 单次丢包最多补几包占位（播放时走 PLC 外推，不是静音） */
 
 /* 交叉淡化长度：2ms。1ms 对 440Hz 只有半个周期，抹不干净阶跃。 */
 #define ALINK_XFADE_FRAMES     (ALINK_SAMPLE_RATE / 500)
@@ -131,21 +100,6 @@
 /* 连续多少包没数据就退回预缓冲状态（40 包 = 200ms） */
 #define ALINK_STARVE_RESET     40
 
-/* ---------- 冗余副本（双发） ----------
- * 发完一包立刻背靠背再发一份完全相同的包，接收端按 seq 去重。
- *
- * 为什么不是 FEC：XOR 奇偶校验包要等整组数据包发完才算得出来，晚 1~4 个包才到，
- * 接收端必须把整组缓存住才能用得上，等于把抖动缓冲再加 5~20ms。而这个场景带宽
- * 根本不紧张 —— 48k 立体声 1.54Mbps，翻倍 3.1Mbps，11n 单流实际吞吐 20Mbps 量级，
- * 只占 15%。用带宽换延迟，比用延迟换带宽划算。
- *
- * 收益边界：能吃掉驱动层丢包、接收 mbox 溢出这类「单次事件」；对持续的信道衰落
- * 无效（两份会一起丢）。所以它是保险，不是万灵药。
- */
-#ifndef ALINK_TX_DUP
-#define ALINK_TX_DUP           0
-#endif
-
 /* ---------- PLC（丢包隐藏） ----------
  * 丢包时不再补静音 —— 静音是「咔」的来源：波形直接阶跃到 0 再跳回来。
  * 改成重复上一包输出，逐次衰减，再接 emit() 的 2ms 交叉淡化抹平接缝。
@@ -157,8 +111,9 @@
 #define ALINK_PLC_DECAY_MAX    4
 
 
+/* 线上消息类型。1 是 UDP 时代的 HELLO（接收端报备 IP），ESP-NOW 用不到，已废弃；
+ * 现有取值不要改，老固件还认这些数。 */
 typedef enum {
-    ALINK_MSG_HELLO = 1,   /* 接收端 → 发送端，告知自己的 IP */
     ALINK_MSG_AUDIO = 2,   /* 发送端 → 接收端，音频数据 */
 } alink_msg_type_t;
 
@@ -167,8 +122,8 @@ typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint16_t type;
     uint16_t seq;
-    uint32_t ts_us;      /* 发送时刻，供接收端估算网络耗时 */
-    uint16_t frames;
+    uint32_t ts_us;      /* 发送时刻（esp_timer 低 32 位）。接收端目前不读，占位 */
+    uint16_t frames;     /* 恒为 ALINK_FRAMES_PER_PKT。接收端目前不读，占位 */
     uint16_t flags;      /* 原 rsvd，现用标志位，见 ALINK_FLAG_* */
 } alink_hdr_t;
 
@@ -184,12 +139,88 @@ typedef struct __attribute__((packed)) {
 
 #define ALINK_HDR_SIZE sizeof(alink_hdr_t)
 
-/* 采样源：先用内部正弦波验链路，接上 ADC 后切到 ADC */
-typedef enum {
-    ALINK_SRC_TONE = 0,
-    ALINK_SRC_ADC  = 1,
-} alink_src_t;
+#define ALINK_ETH_ALEN 6     /* 与 ESP_NOW_ETH_ALEN 相同 */
 
-#ifndef ALINK_TX_SOURCE
-#define ALINK_TX_SOURCE ALINK_SRC_TONE
-#endif
+/* ---------- MAC 字符串解析（两端共用） ----------
+ *
+ * 接受三种写法，大小写都行，首尾空白会被去掉，其余必须严格匹配：
+ *   aa:bb:cc:dd:ee:ff   aa-bb-cc-dd-ee-ff   每段 1~2 位十六进制，分隔符不能混用
+ *   aabbccddeeff        正好 12 位十六进制
+ * 少一位、多一位、某段超过 0xFF、带多余字符，一律返回 false。
+ *
+ * 故意不放宽。配置串写错时，调用方会退回默认值并把原始串打进日志；
+ * 静默解析成「另一个合法地址」才是烧进去没声音又查不出来的那种错。 */
+static inline int alink_hex_val(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+static inline bool alink_mac_from_str(const char *s, uint8_t out[ALINK_ETH_ALEN])
+{
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t')) {
+        len--;
+    }
+
+    /* 以第一次出现的分隔符为准 */
+    char sep = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == ':' || s[i] == '-') {
+            sep = s[i];
+            break;
+        }
+    }
+
+    memset(out, 0, ALINK_ETH_ALEN);
+
+    if (sep == 0) {
+        /* 不带分隔符：正好 12 位 */
+        if (len != ALINK_ETH_ALEN * 2) {
+            return false;
+        }
+        for (int i = 0; i < ALINK_ETH_ALEN; i++) {
+            const int hi = alink_hex_val(s[i * 2]);
+            const int lo = alink_hex_val(s[i * 2 + 1]);
+            if (hi < 0 || lo < 0) {
+                return false;
+            }
+            out[i] = (uint8_t)((hi << 4) | lo);
+        }
+        return true;
+    }
+
+    int n = 0, acc = 0, digits = 0;
+    for (size_t i = 0; i <= len; i++) {
+        /* 走到末尾时补一个分隔符，把最后一段收掉 */
+        const char c = (i < len) ? s[i] : sep;
+        const int  v = (c == sep) ? -1 : alink_hex_val(c);
+        if (v >= 0) {
+            acc = acc * 16 + v;
+            if (++digits > 2) {
+                return false;       /* 这一段超过 0xFF */
+            }
+        } else if (c == sep) {
+            if (digits == 0 || n >= ALINK_ETH_ALEN) {
+                return false;       /* 空段，或多于 6 段 */
+            }
+            out[n++] = (uint8_t)acc;
+            acc    = 0;
+            digits = 0;
+        } else {
+            return false;           /* 非十六进制字符，或两种分隔符混用 */
+        }
+    }
+    return n == ALINK_ETH_ALEN;
+}

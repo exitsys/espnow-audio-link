@@ -1,0 +1,17 @@
+menu "Audio link"
+
+    config ALINK_TX_MAC
+        string "发射端 MAC 地址（留空 = 不校验）"
+        default ""
+        help
+            只接受这个 MAC 发来的音频包。ESP-NOW 不加密，同信道上任何设备只要往
+            接收端的地址发帧都会被当成音频，这一项是一道可选的白名单。
+
+            留空（默认）= 不校验，行为和没有这个选项时完全一样。
+            写法和发射端的「接收端 MAC 地址」一致，三种都接受：
+            aa:bb:cc:dd:ee:ff、aa-bb-cc-dd-ee-ff、aabbccddeeff（正好 12 位）。
+
+            填了但格式不对时不会启用校验，串口会打印错误和你填的原始内容。
+            发射端上电时串口会打印「本机 xx:xx:...」，抄过来即可。
+
+endmenu
