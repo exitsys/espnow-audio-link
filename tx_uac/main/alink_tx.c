@@ -12,16 +12,18 @@
  *
  * 为什么是「数据驱动」而不是「固定节拍」：
  * UAC 的数据是主机的 USB 时钟推进来的，和 S3 的定时器不同源。按固定 5ms 发，
- * USB 侧缓冲必然缓慢堆积或抽干，而且这个漂移发生在 TX 侧，从 C3 的日志里看不见。
+ * USB 侧缓冲必然缓慢堆积或抽干，而且这个漂移发生在 TX 侧，从接收端的日志里看不见。
  * 所以 tx_task 只做一件事：阻塞到 StreamBuffer 里攒够一整包，就发出去。
  *
  * usb_device_uac 用的是 ASYNCHRONOUS + feedback 端点（见组件
  * tusb_uac/uac_descriptors.h 的 TUSB_ISO_EP_ATT_ASYNCHRONOUS 和 FB_EP），
- * 也就是说设备这边 FIFO 水位会反向告知主机调速 —— TX 侧的时钟漂移由它兜住，
- * 不需要我们再丢样本补样本。
+ * 但本工程的本地补丁把反馈值钉在了标称速率上（见组件 usb_device_uac.c）：
+ * TX 只负责把主机送来的数据原样转发，不丢样本也不补样本，
+ * 收发两端的时钟差全部交给接收端的水位闭环和 I2S 时钟跟随去消化。
  *
- * 每包背靠背发两份（ALINK_TX_DUP），接收端按 seq 去重。带宽翻倍到 3.1Mbps，
- * 换掉驱动层丢包和接收 mbox 溢出这类单次事件；持续衰落仍然要靠接收端 PLC 兜。
+ * 每包只发一份，不重发、不做 FEC。ESP-NOW 单播每包有硬件 ACK，发送回调直接给出
+ * 逐包成败；丢掉的包由接收端按 seq 补占位、走 PLC 外推。重发会把这一包的发送时刻
+ * 推后，反而制造抖动。
  *
  * ---------------------------------------------------------------------------
  * 注意：S3 的 USB-OTG 和 USB-Serial-JTAG 共用 GPIO19/20，二选一。
@@ -96,11 +98,27 @@ static void led_strip_off(int pin)
         spi_device_transmit(h, &t);
         spi_bus_remove_device(h);
     }
+
+    /* 帧后保持低电平 >280us（WS2812B 的 Treset 下限），灯珠才会锁存这一帧。
+     * 这段等待必须放在 spi_bus_free() 之前：此刻 MOSI 还归 SPI 管，空闲电平就是 0。
+     * spi_bus_free() 会把引脚复位成「禁用 + 上拉」，数据线立刻被拉高，
+     * 就不再满足锁存条件了。 */
+    vTaskDelay(pdMS_TO_TICKS(2));
+
     spi_bus_free(SPI2_HOST);
 
-    /* 帧后保持低电平 >50us，让灯珠锁存并复位 */
-    gpio_set_level(pin, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    /* free 之后引脚是「禁用 + 上拉」，gpio_set_level() 改不了它。
+     * 重新配成推挽输出并拉低，给数据线一个确定的空闲电平。 */
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&io) == ESP_OK) {
+        gpio_set_level(pin, 0);
+    }
 }
 
 static void led_all_off(void)
@@ -157,40 +175,14 @@ static StreamBufferHandle_t s_pcm_sb;
  * 976 字节一包靠 ESP-NOW v2（上限 1470），两端 IDF 都是 5.5，不需要分片。
  */
 /* 接收端 MAC：menuconfig 里配（Component config → Audio link → 接收端 MAC 地址），
- * 不需要改代码。没配时退回下面的默认值，保证老固件行为不变。 */
+ * 不需要改代码。没配时退回下面的默认值，保证老固件行为不变。
+ * Kconfig.projbuild 里的 default 必须和这里保持一致。 */
+#define ALINK_RX_MAC_DEFAULT "84:c7:bb:5a:73:94"
 #ifndef CONFIG_ALINK_RX_MAC
-#define CONFIG_ALINK_RX_MAC "84:c7:bb:5a:73:94"
+#define CONFIG_ALINK_RX_MAC ALINK_RX_MAC_DEFAULT
 #endif
 
 static uint8_t s_peer[ESP_NOW_ETH_ALEN];
-
-/* 解析 "aa:bb:cc:dd:ee:ff" 或 "aa-bb-cc-dd-ee-ff"。
- * 解析失败返回 false，调用方退到默认 MAC —— 比直接编译期报错友好：
- * 用户填个 "84C7BB5A7394" 也能用，而不是烧进去以后一声不响。 */
-static bool mac_from_str(const char *s, uint8_t out[ESP_NOW_ETH_ALEN])
-{
-    unsigned v[ESP_NOW_ETH_ALEN];
-    const int n = sscanf(s, "%x:%x:%x:%x:%x:%x",
-                         &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
-    if (n != ESP_NOW_ETH_ALEN &&
-        sscanf(s, "%x-%x-%x-%x-%x-%x",
-               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != ESP_NOW_ETH_ALEN) {
-        /* 也接受不带分隔符的 12 位十六进制 */
-        unsigned long long all = 0;
-        if (sscanf(s, "%12llx", &all) != 1) {
-            return false;
-        }
-        for (int i = ESP_NOW_ETH_ALEN - 1; i >= 0; i--) {
-            out[i] = (uint8_t)(all & 0xFF);
-            all >>= 8;
-        }
-        return true;
-    }
-    for (int i = 0; i < ESP_NOW_ETH_ALEN; i++) {
-        out[i] = (uint8_t)v[i];
-    }
-    return true;
-}
 static volatile uint32_t s_ack_ok, s_ack_fail;
 static volatile int64_t  s_ack_ok_us;      /* 最近一次收到 ACK 的时刻 */
 
@@ -227,12 +219,13 @@ static void wifi_espnow_init(void)
 #pragma GCC diagnostic pop
 
     /* 解析 menuconfig 里的接收端 MAC。填错就退回默认值并报出来，
-     * 免得「烧进去没声音、还不知道是地址写错了」。 */
-    if (!mac_from_str(CONFIG_ALINK_RX_MAC, s_peer)) {
-        const char *fb = "84:c7:bb:5a:73:94";
-        mac_from_str(fb, s_peer);
+     * 免得「烧进去没声音、还不知道是地址写错了」。
+     * 解析是严格的（见 alink_common.h）：少一位、多一段、某段超过 0xFF 都算错，
+     * 不会悄悄解析成另一个地址。接受的三种写法见 README。 */
+    if (!alink_mac_from_str(CONFIG_ALINK_RX_MAC, s_peer)) {
+        alink_mac_from_str(ALINK_RX_MAC_DEFAULT, s_peer);
         ESP_LOGE(TAG, "CONFIG_ALINK_RX_MAC=\"%s\" 格式非法，改用默认 %s",
-                 CONFIG_ALINK_RX_MAC, fb);
+                 CONFIG_ALINK_RX_MAC, ALINK_RX_MAC_DEFAULT);
     }
 
     esp_now_peer_info_t peer = { 0 };
@@ -387,12 +380,20 @@ static int16_t s_last_l = 0, s_last_r = 0;
  * 断供期间仍然按 200 包/秒发静音，接住接收端的 I2S 时钟。 */
 static bool s_starving = false;
 
+/* 断供态的绝对节拍（us）：下一个静音包的截止时刻，0 = 不在节拍上。
+ *
+ * 静音包必须平均严格 200 包/秒。每包就是 5ms 音频，接收端按 200 包/秒消费，
+ * 发慢了接收端队列会被持续抽干，一两秒就欠载，然后反复「欠载 → 退回预缓冲」。
+ * 「等 5ms 再发」这种相对计时做不到：每次等待都有向上取整的零头，累积起来就慢了。
+ * 所以用绝对时刻排队，一拍拖长了下一拍自动补短。 */
+static int64_t s_starve_grid = 0;
+
 static void tx_task(void *arg)
 {
     static uint8_t pkt[ALINK_HDR_SIZE + ALINK_PAYLOAD_BYTES];
     uint8_t *pcm = pkt + ALINK_HDR_SIZE;
 
-    uint32_t sent = 0, dropped = 0, starve = 0, shortread = 0;
+    uint32_t sent = 0, dropped = 0, starve = 0, shortread = 0, misalign = 0;
     int64_t t_prev = esp_timer_get_time();
     int64_t gap_min = 1 << 30, gap_max = 0, gap_sum = 0;
     uint32_t gap_n = 0;
@@ -422,21 +423,60 @@ static void tx_task(void *arg)
          * 30ms 给 6 倍余量：正常情况数据一凑满就立刻发，包率仍是 200/s；
          * 只有音乐真停了才会走到补位。补位状态下退回 5ms 一拍，
          * 保持静音包的节奏，别让接收端 I2S 断流。 */
-        const int64_t wait_us = s_starving ? 5000 : 30000;
-        const int64_t deadline = esp_timer_get_time() + wait_us;
+        int64_t deadline;
+        {
+            const int64_t now = esp_timer_get_time();
+            if (!s_starving) {
+                deadline      = now + 30000;
+                s_starve_grid = 0;        /* 有数据的状态不在节拍上 */
+            } else {
+                /* 断供态按绝对节拍排队（见 s_starve_grid）。刚从 30ms 窗口切过来，
+                 * 或上一拍已经拖过下一个格点，就重新起拍 —— 不为了追格点连发。 */
+                if (s_starve_grid == 0 || now - s_starve_grid >= ALINK_PKT_MS * 1000) {
+                    s_starve_grid = now + ALINK_PKT_MS * 1000;
+                }
+                deadline      = s_starve_grid;
+                s_starve_grid += ALINK_PKT_MS * 1000;
+            }
+        }
 
         while (total < ALINK_PAYLOAD_BYTES) {
-            if (esp_timer_get_time() >= deadline) {
+            const int64_t now = esp_timer_get_time();
+            if (now >= deadline) {
                 break;
+            }
+            /* 每次最多等 2 个 tick，但不超过距 deadline 的剩余时间（向上取整到 tick）。
+             * 原来固定等 2 个 tick、回到循环顶部才看 deadline：5ms 的窗口落在第 3、4 次
+             * 等待中间，一拍实际 3~8ms，静音包只有 165 包/秒左右。 */
+            const int64_t rem_us    = deadline - now;
+            const int64_t ticks_max = (int64_t)pdMS_TO_TICKS(2);
+            int64_t ticks = (rem_us * (int64_t)configTICK_RATE_HZ + 999999) / 1000000;
+            if (ticks > ticks_max) {
+                ticks = ticks_max;
+            }
+            if (ticks < 1) {
+                ticks = 1;
             }
             size_t n = xStreamBufferReceive(s_pcm_sb, pcm + total,
                                             ALINK_PAYLOAD_BYTES - total,
-                                            pdMS_TO_TICKS(2));
+                                            (TickType_t)ticks);
             total += n;
         }
         s_starving = (total < ALINK_PAYLOAD_BYTES);
 
-        const int nf_missing = (int)((ALINK_PAYLOAD_BYTES - total) / ALINK_FRAME_BYTES);
+        /* 帧对齐自检。UAC 组件回调给出的长度应当恒为整帧；不是整帧说明组件侧的
+         * 水位线又没对齐（见 usb_device_uac.c 的 level_set）。这里记一笔让它在日志里
+         * 现形，同时把不足一帧的尾巴并入第一帧补位，保证 240 帧全部写满 ——
+         * 原来按 total/4 截断，这种包的最后一帧会残留上一包的旧数据。 */
+        const int nfr = (int)((total + ALINK_FRAME_BYTES - 1) / ALINK_FRAME_BYTES);
+        if (total % ALINK_FRAME_BYTES != 0) {
+            misalign++;
+            if ((misalign % 50) == 1) {
+                ESP_LOGW(TAG, "半包长度 %u 不是整帧（累计 %lu 次），检查 UAC 组件的 level_set",
+                         (unsigned)total, (unsigned long)misalign);
+            }
+        }
+        const int nf_missing = ALINK_FRAMES_PER_PKT - nfr;
         bool pad_flag = false;
         if (nf_missing > 0) {
             pad_flag = true;
@@ -467,7 +507,6 @@ static void tx_task(void *arg)
         {
             static int32_t g_cur = 65536;
             const int32_t g_tgt = s_muted ? 0 : s_vol_q16;
-            const int nfr = (int)(total / ALINK_FRAME_BYTES);
             int16_t *s16 = (int16_t *)pcm;
 
             if (nfr > 0 && g_cur != g_tgt) {
@@ -498,14 +537,14 @@ static void tx_task(void *arg)
          * 真实数据，两次一阶不连续，听感就是「咔」。实测 29 秒零丢包零欠载
          * 仍有零星爆音，源头就在这条路径（UAC 回调偶尔迟到 5ms 就会触发）。
          *
-         * 改成沿「最后一个有效样本」做包络衰减：一包走 1/256（Q8 步长 1），
-         * 约 10ms 滑到 0；恢复供数时再同样淡入。10ms 的淡入淡出听不出来，
-         * 却足以把阶跃变成连续曲线。 */
+         * 改成沿「最后一个有效样本」做包络衰减：每帧减 1（Q8 步长 1），从满幅
+         * 滑到 0 要 256 帧 ≈ 5.3ms；恢复供数时每帧加 2，128 帧 ≈ 2.7ms 淡入。
+         * 这么短的淡入淡出听不出来，却足以把阶跃变成连续曲线。 */
         {
             int16_t *s16 = (int16_t *)pcm;
             const int nf_pkt = ALINK_FRAMES_PER_PKT;
             if (nf_missing > 0) {
-                int16_t *tail = s16 + (int)(total / ALINK_FRAME_BYTES) * 2;
+                int16_t *tail = s16 + nfr * 2;
                 for (int i = 0; i < nf_missing; i++) {
                     s_gap_gain -= 1;
                     if (s_gap_gain < 0) {
@@ -639,7 +678,12 @@ void app_main(void)
      * 一被压住就攒下几包，恢复后连着发出去 —— 接收端看到的队列水位因此从 17 掉到 6
      * 再蹦回去（实测 168 秒里有 7 次这种锯齿，其中 27 次直接把队列吃到 0，欠载）。
      *
-     * core1 上只有 tx 和（无亲和性的）USB 任务，节拍稳得多。
+     * USB 任务（TinyUSB 和 usb_spk_task）在 sdkconfig.defaults 里显式绑到了同一个 core1
+     * （CONFIG_UAC_TINYUSB_TASK_CORE / CONFIG_UAC_SPK_TASK_CORE），core0 只留 WiFi。
+     * 别改回 -1（无亲和性）：IDF 的 SMP 调度对无亲和性任务不限定核，哪个核先调度到
+     * 就跑在哪，通常跟着唤醒它的中断走，结果就是回到和 WiFi 抢 CPU 的状态。
+     * usb_spk_task 在回调里读的 spk_buf 和 USB 中断共用，被 WiFi 抢占超过 1ms，
+     * 下一次中断就会覆盖缓冲或清掉长度，丢 1ms 音频。
      * 优先级保持 6：低于 USB 的 10，保证 UAC 取数永远先于拼包。 */
     xTaskCreatePinnedToCore(tx_task, "tx", 4096, NULL, 6, NULL, 1);
 

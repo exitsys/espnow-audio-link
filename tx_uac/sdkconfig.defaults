@@ -17,12 +17,15 @@ CONFIG_UAC_BIT_RESOLUTION_16=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED is not set
 
-# ---- WiFi ----
-# 音频包 5ms 一个，lwIP 默认 6 个 recvmbox 位置撑不住调度延迟
-CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
-CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
-
 # USB 任务必须高于 tx_task(6)：UAC 每 1ms 要取 192 字节，
 # 被拼包任务压在后面就会整批迟到，接收端队列跟着抖。
 CONFIG_UAC_TINYUSB_TASK_PRIORITY=10
 CONFIG_UAC_SPK_TASK_PRIORITY=10
+
+# USB 任务显式绑到 core1，和 tx_task 同核；core0 只留给 WiFi 驱动。
+# 默认值 -1 是「无亲和性」，落在哪个核由调度器决定，结果往往是 USB 任务和
+# WiFi 抢 CPU：usb_spk_task 读的 spk_buf 和 USB 中断共用，被 WiFi（优先级 23）
+# 抢占超过 1ms 就会丢 1ms 音频。
+# 改这里之后，已经生成的 sdkconfig 不会自动跟着变，要同步改或者删掉重新生成。
+CONFIG_UAC_TINYUSB_TASK_CORE=1
+CONFIG_UAC_SPK_TASK_CORE=1

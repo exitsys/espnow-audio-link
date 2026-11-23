@@ -4,8 +4,12 @@ menu "Audio link"
         string "接收端 MAC 地址"
         default "84:c7:bb:5a:73:94"
         help
-            接收端那块 ESP32 的 WiFi MAC，格式 aa:bb:cc:dd:ee:ff（大小写都行，
-            也接受 aa-bb-cc-dd-ee-ff）。ESP-NOW 是单播，必须知道对端地址。
+            接收端那块 ESP32 的 WiFi MAC。接受三种写法，大小写都行：
+            aa:bb:cc:dd:ee:ff、aa-bb-cc-dd-ee-ff、aabbccddeeff（正好 12 位）。
+            ESP-NOW 是单播，必须知道对端地址。
+
+            格式不对（少一位、多一段、某段超过 FF）时，固件会退回内置默认值，
+            并在串口打印你填的原始内容 —— 不会悄悄解析成另一个地址。
 
             接收端上电时串口会打印自己的 MAC，抄过来填这里，再重新编译烧录。
 

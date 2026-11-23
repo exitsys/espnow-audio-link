@@ -7,8 +7,26 @@ USB Audio Class 2 设备组件，来自 Espressif 的 [esp-iot-solution](https:/
 
 - 许可：Apache License 2.0，原文见 `tx_uac/components/usb_device_uac/license.txt`
 - 版权：Copyright 2023-2026 Espressif Systems (Shanghai) CO LTD
-- 本项目的改动：主机音量回调映射到 −50~0 dB（`uac_descriptors.h`、
-  `usb_device_uac.c` 中的音量范围与步进），以及任务优先级的调整。功能逻辑未改。
+- 组件目录里的 `CHECKSUMS.json` 是上游各文件的 SHA-256，可以用来核对哪些文件被改过
+
+本项目**只修改了其中一个文件**：`usb_device_uac.c`（文件头有改动声明，改动处都标了「本工程补丁」）。
+
+1. `tud_audio_set_itf_cb`：删掉两处 `printf`。这个回调运行在 USB 中断上下文里，
+   裸 `printf` 和 `ESP_LOG` 用的不是同一把 stdout 锁，混用会破坏日志输出，严重时让 USB 任务卡死。
+2. `tud_audio_rx_done_isr`，**反馈值固定为标称采样率**，不再使用 TinyUSB 的 FIFO_COUNT 反馈算法。
+   原算法在电视盒子上会把反馈值压到 47.01kHz，主机随之降速，接收端持续欠载。
+   收发两端的时钟差改由本项目的接收端消化（水位闭环 + I2S 时钟跟随）。
+3. `tud_audio_rx_done_isr`，**只读走 FIFO 半满线以上的数据**，把水位钉在 `level_set`。
+   原版每帧无条件读走 1ms，把 FIFO 抽空，反馈端点因此一直催主机加速，最终爬到 1.8 倍速率。
+   起播前的等待水位也相应改成 `level_set`。
+4. `tud_audio_rx_done_isr`，**`level_set` 按帧长向下取整**，保证交给应用层的始终是整帧。
+   不取整时首块是 266 字节（66 帧多 1 个样本），应用层在一次半包之后会左右声道错位。
+
+组件的其余文件与上游逐字节一致。音量的范围、步进，以及 `set_volume_cb` 的 0~100 映射，
+都是上游原有实现，本项目没有改。
+
+任务优先级和绑核（`CONFIG_UAC_*_TASK_PRIORITY` / `CONFIG_UAC_*_TASK_CORE`）属于应用配置，
+在 `tx_uac/sdkconfig.defaults` 里，不是对组件的改动。
 
 ## 其余
 

@@ -4,6 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/*
+ * 【本工程改动】espnow_audio，2026-11。改动一览见仓库根目录 NOTICE.md，
+ * 文件内的改动处都标了「本工程补丁」。
+ *
+ *   1. tud_audio_set_itf_cb：去掉 USB 中断上下文里的 printf。
+ *   2. tud_audio_rx_done_isr：反馈值固定为标称速率，不再交给 TinyUSB 的
+ *      FIFO_COUNT 算法；只读走 FIFO 半满线以上的数据，水位线按帧长对齐。
+ */
+
 #include <string.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
@@ -422,17 +431,29 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
      *    40ms 的 StreamBuffer 和 RX 侧的水位闭环吸收，不需要 USB 侧精细调速。 */
     {
         const uint32_t frame_div = (tud_speed_get() == TUSB_SPEED_FULL) ? 1000 : 8000;
-        /* 实测盒子对反馈值有个固定的 63/64 折扣（发 48000 样本/秒，实际只按 47250 送，
-         * 正好是 63/64，和 FIFO 那个 EMA 系数同形）。这里按 64/63 预补偿，
-         * 让它真正落在 48k 上。改完用 S3 日志的「UAC=xxxxx B/s」验收：
-         * 目标是 192000 B/s，RX 的「欠载」应停止增长。 */
-        uint32_t spm = (s_uac_device->current_sample_rate / frame_div) * 64 / 63;
+        /* 这里写的就是标称值本身，不要加预补偿。
+         *
+         * 这一行曾按注释写成「×64/63，补盒子 63/64 的折扣」，但整型运算
+         * (48000/1000)*64/63 = 3072/63 = 48，结果和标称值一模一样，补偿从未生效；
+         * 而实测盒子送 47.93k（差 0.15%，不是 1.56%），说明折扣这个结论本身也不成立。
+         * 别把它「修对」：真按 48.76 样本/帧发，主机会被催快 1.6%，重采样 ±0.3% 的上限
+         * 吃不下，接收端队列会一直溢出。验收仍然看 S3 日志的「UAC=xxxxx B/s」，
+         * 目标 192000 B/s。 */
+        const uint32_t spm = s_uac_device->current_sample_rate / frame_div;
         tud_audio_n_fb_set(func_id, spm << 16);
     }
 
-    /*!< 水位目标：让 FIFO 停在一半左右，只作为防溢出/防抽干的保护。 */
-    const size_t half = CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ / 2;
-    const size_t level_set = (half > bytes_per_ms) ? (half - bytes_per_ms) : bytes_per_ms;
+    /*!< 水位目标：让 FIFO 停在一半左右，只作为防溢出/防抽干的保护。
+     *
+     * 必须按帧长对齐（帧长 = 每样本字节 × 声道数，立体声 16bit = 4）。
+     * 2156/2 - 192 = 886 不是 4 的倍数：起播后 FIFO 以整帧递增，到 1152 才第一次
+     * 读走 266 字节（66 帧多 1 个样本），此后交给应用的字节流余量恒差 2 字节。
+     * 应用层按整帧拼包，一次「半包」就会让后面的包全部错开一个样本（左右声道对调）。
+     * 向下取整到 884 之后首块是 268 字节，读走的始终是整帧。 */
+    const size_t frame_sz  = CFG_TUD_AUDIO_FUNC_1_FORMAT_1_FRAME_SZ_RX;
+    const size_t half      = CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ / 2;
+    const size_t level_raw = (half > bytes_per_ms) ? (half - bytes_per_ms) : bytes_per_ms;
+    const size_t level_set = level_raw - level_raw % frame_sz;
 
     if (new_play) {
         if (bytes_remained < (int)level_set) {
@@ -453,7 +474,7 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
      *    听感：音调正常（I2S 仍是 48k），但内容一直在跳，即"断续/发碎"。
      *
      *    修法：只读走超出目标水位的部分，把 FIFO 钉在半满，反馈才能稳在 48k。
-     *    稳态下每包进 192、读 192，水位恒定在 960 字节（约 5ms）。 */
+     *    稳态下每包进 192、读 192，水位恒定在 level_set（884 字节，约 4.6ms）。 */
     int over = bytes_remained - (int)level_set;
     if (over < (int)bytes_per_ms) {
         return true;        /*!< 还没攒够一包，等下一包。反馈看到水位低会催主机多发，正常 */
