@@ -160,6 +160,28 @@ static const char *TAG = "alink_rx";
 #define ALINK_WIFI_SCAN 0
 #endif
 
+/* 启动时量一遍每个信道的实际占用（临时诊断用，正常固件保持 0）
+ *
+ * ALINK_WIFI_SCAN 只能看出「哪个信道上有 AP、信号多强」，看不出「谁在传数据」。
+ * 而让链路卡顿的是流量：一个信号很强的 AP 如果没有客户端在用，只发信标，不碍事；
+ * 一个信号一般的 AP 只要在给手机传视频，就足够把相邻信道占满。
+ *
+ * 打开后接收端启动时依次切到 1~13 信道，各听 ALINK_WIFI_SURVEY_MS 毫秒，
+ * 统计帧数、估计占用的空口时间（帧长 ÷ 调制速率，含信标）、信号最强的帧，
+ * 以及占用时间最多的 3 个发射端（MAC 可以和 ALINK_WIFI_SCAN 的 AP 列表对上）。
+ * 配了发送方白名单（menuconfig 的「发射端 MAC 地址」）时，本链路自己的帧不算在里面；
+ * 没配的话，TX 所在信道的头一名就是它自己（2026-11-25 实测：3 秒里 631 帧、约 190‰），
+ * 对照着扣掉即可。
+ *
+ * 13 个信道共约 40 秒，期间链路不通。它是启动时的一张快照，邻居不忙时看到的都是安静；
+ * 想抓现行，挑听到卡顿的时候让 RX 单独复位重跑一遍（TX 不用动）。看完改回 0 重烧。 */
+#ifndef ALINK_WIFI_SURVEY
+#define ALINK_WIFI_SURVEY 0
+#endif
+#ifndef ALINK_WIFI_SURVEY_MS
+#define ALINK_WIFI_SURVEY_MS 3000
+#endif
+
 /* DMA 深度直接决定「用户看不见的额外延迟」：i2s_channel_write 只要 DMA 有空位就
  * 立刻返回，所以队列里的包会被迅速灌进 DMA，队列深度本身不代表真实缓冲。
  * 延时 = dma_desc_num × dma_frame_num / fs（dma_frame_num = 240 帧 @48k = 5ms）：
@@ -1428,6 +1450,150 @@ static void wifi_scan_print(void)
 }
 #endif
 
+#if ALINK_WIFI_SURVEY
+#define SURV_SLOTS 16
+typedef struct {
+    uint8_t  mac[6];
+    uint32_t frames;
+    uint32_t air_us;
+    int8_t   rssi;
+} survey_tx_t;
+static survey_tx_t s_surv_tx[SURV_SLOTS];
+static uint32_t s_surv_frames, s_surv_air_us;
+static int8_t   s_surv_rssi;
+
+/* 帧的调制速率（bit/s）。只求量级对，用来把帧长折成空口时间。
+ * 11n 看 mcs 序号（20MHz、长保护间隔是 6.5M 的整数倍）；非 11n 的 rate 字段是序号：
+ * 11b 的 0~3 是 1/2/5.5/11M，11g 的 0~7 是 6/9/12/18/24/36/48/54M。
+ * 序号超出这个范围时按「速率 ÷ 500k」理解（别的芯片是这么编码的）。 */
+static uint32_t survey_phy_rate(const wifi_pkt_rx_ctrl_t *c)
+{
+    if (c->sig_mode == 1 || c->sig_mode == 3) {
+        return (c->mcs <= 7) ? 6500000u * (c->mcs + 1) : 65000000u;
+    }
+    if (c->rate <= 7) {
+        static const uint32_t b[4] = { 1000000u, 2000000u, 5500000u, 11000000u };
+        static const uint32_t g[8] = { 6000000u, 9000000u, 12000000u, 18000000u,
+                                       24000000u, 36000000u, 48000000u, 54000000u };
+        return (c->sig_mode == 0 && c->rate < 4) ? b[c->rate] : g[c->rate];
+    }
+    return (uint32_t)c->rate * 500000u;             /* 序号超出以上范围：按「速率 ÷ 500k」理解 */
+}
+
+/* 混听回调，跑在 WiFi 任务里：只做累加，每个发射端占一个槽。 */
+static void survey_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) {
+        return;                     /* 控制帧（ACK/RTS/CTS）很短，不单独计 */
+    }
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const wifi_pkt_rx_ctrl_t *c = &pkt->rx_ctrl;
+    if (c->sig_len < 24) {
+        return;                     /* 管理帧和数据帧的头部至少 24 字节，再短的不是完整帧 */
+    }
+    /* pkt->payload 就是 802.11 帧头：帧控制 2 + 持续时间 2 + addr1（接收方）6 + addr2（发射端）6，
+     * 所以发射端在第 10 字节。2026-11-25 第一版写成第 6 字节，读出来是 addr1 的尾巴接 addr2 的
+     * 开头（广播帧就是 ff:ff:ff:ff:xx:xx），白名单也因此没扣掉本链路自己的帧。 */
+    const uint8_t *src = pkt->payload + 10;
+    if (s_filter_tx && memcmp(src, s_peer_tx, 6) == 0) {
+        return;                                    /* 本链路自己的帧不算 */
+    }
+    const uint32_t rate = survey_phy_rate(c);
+    /* 帧长折成时间，再加约 150us 的前导码、帧间隔和 ACK */
+    const uint32_t t_us = (uint32_t)((c->sig_len * 8ULL * 1000000u) / rate) + 150u;
+
+    s_surv_frames++;
+    s_surv_air_us += t_us;
+    if (c->rssi > s_surv_rssi) {
+        s_surv_rssi = c->rssi;
+    }
+    int free_slot = -1;
+    for (int i = 0; i < SURV_SLOTS; i++) {
+        if (s_surv_tx[i].frames == 0) {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+        } else if (memcmp(s_surv_tx[i].mac, src, 6) == 0) {
+            s_surv_tx[i].frames++;
+            s_surv_tx[i].air_us += t_us;
+            if (c->rssi > s_surv_tx[i].rssi) {
+                s_surv_tx[i].rssi = c->rssi;
+            }
+            return;
+        }
+    }
+    if (free_slot >= 0) {
+        memcpy(s_surv_tx[free_slot].mac, src, 6);
+        s_surv_tx[free_slot].frames = 1;
+        s_surv_tx[free_slot].air_us = t_us;
+        s_surv_tx[free_slot].rssi = c->rssi;
+    }
+}
+
+static void wifi_survey_run(void)
+{
+    const uint32_t ms = ALINK_WIFI_SURVEY_MS;
+    const wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
+    };
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(survey_cb);
+    ESP_LOGW(TAG, "==== 2.4G 占用统计：每个信道听 %lu ms（占用按帧长和速率估，含信标）====",
+             (unsigned long)ms);
+    for (int ch = 1; ch <= 13; ch++) {
+        memset(s_surv_tx, 0, sizeof(s_surv_tx));
+        s_surv_frames = 0;
+        s_surv_air_us = 0;
+        s_surv_rssi = -128;
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(true);
+        vTaskDelay(pdMS_TO_TICKS(ms));
+        esp_wifi_set_promiscuous(false);
+
+        if (s_surv_frames == 0) {
+            ESP_LOGW(TAG, "  信道 %2d  没有帧", ch);
+            continue;
+        }
+        ESP_LOGW(TAG, "  信道 %2d  %5lu 帧  占用约 %3lu‰  最强 %4d dBm",
+                 ch, (unsigned long)s_surv_frames,
+                 (unsigned long)(s_surv_air_us / ms), (int)s_surv_rssi);
+        /* 按占用时间列出前 3 个发射端 */
+        for (int k = 0; k < 3; k++) {
+            int best = -1;
+            for (int i = 0; i < SURV_SLOTS; i++) {
+                if (s_surv_tx[i].frames && (best < 0 || s_surv_tx[i].air_us > s_surv_tx[best].air_us)) {
+                    best = i;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            ESP_LOGW(TAG, "      发射端 " MACSTR "  %5lu 帧  %3lu‰  %4d dBm",
+                     MAC2STR(s_surv_tx[best].mac),
+                     (unsigned long)s_surv_tx[best].frames,
+                     (unsigned long)(s_surv_tx[best].air_us / ms), (int)s_surv_tx[best].rssi);
+            s_surv_tx[best].frames = 0;
+        }
+    }
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    ESP_LOGW(TAG, "==== 占用统计结束（本链路用的是信道 %d）====", ALINK_WIFI_CHANNEL);
+}
+#endif
+
+/* 解析 menuconfig 里的发送方白名单（Component config → Audio link → 发射端 MAC 地址）。
+ * 留空 = 不校验，和没有这个选项时的行为一致。
+ * 填了但格式非法时不启用，并且大声报出来：白名单是可选的加固，
+ * 不该因为一个拼写错误让整机没声音。 */
+static void tx_mac_parse(void)
+{
+    s_filter_tx = (CONFIG_ALINK_TX_MAC[0] != '\0') &&
+                  alink_mac_from_str(CONFIG_ALINK_TX_MAC, s_peer_tx);
+    if (CONFIG_ALINK_TX_MAC[0] != '\0' && !s_filter_tx) {
+        ESP_LOGE(TAG, "CONFIG_ALINK_TX_MAC=\"%s\" 格式非法，本次不校验发送方",
+                 CONFIG_ALINK_TX_MAC);
+    }
+}
+
 static void wifi_espnow_init(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -1444,8 +1610,13 @@ static void wifi_espnow_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* 两个启动诊断都要先知道发射端的 MAC，才好把本链路自己的帧从统计里去掉。 */
+    tx_mac_parse();
 #if ALINK_WIFI_SCAN
     wifi_scan_print();
+#endif
+#if ALINK_WIFI_SURVEY
+    wifi_survey_run();
 #endif
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));       /* 关省电，这项最能压延迟 */
     ESP_ERROR_CHECK(esp_wifi_set_channel(ALINK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
@@ -1466,17 +1637,6 @@ static void wifi_espnow_init(void)
     esp_err_t r = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_11M_L);
     if (r != ESP_OK) ESP_LOGW(TAG, "config_espnow_rate: %s", esp_err_to_name(r));
 #pragma GCC diagnostic pop
-
-    /* 发送方白名单（menuconfig → Component config → Audio link → 发射端 MAC 地址）。
-     * 留空 = 不校验，和没有这个选项时的行为一致。
-     * 填了但格式非法时不启用，并且大声报出来：白名单是可选的加固，
-     * 不该因为一个拼写错误让整机没声音。 */
-    s_filter_tx = (CONFIG_ALINK_TX_MAC[0] != '\0') &&
-                  alink_mac_from_str(CONFIG_ALINK_TX_MAC, s_peer_tx);
-    if (CONFIG_ALINK_TX_MAC[0] != '\0' && !s_filter_tx) {
-        ESP_LOGE(TAG, "CONFIG_ALINK_TX_MAC=\"%s\" 格式非法，本次不校验发送方",
-                 CONFIG_ALINK_TX_MAC);
-    }
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
