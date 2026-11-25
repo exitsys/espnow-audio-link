@@ -150,6 +150,16 @@ static void led_all_off(void)
 #define STREAM_PKTS      8
 #define STREAM_BYTES     (STREAM_PKTS * ALINK_PAYLOAD_BYTES)
 
+/* 断供态追发的两个量（见 tx_task 里的节拍段）。
+ *
+ * 2026-11-25 上板实测：原来只要拖过一个格点就重新起拍，等于少发一个静音包。
+ * 每 2 秒的统计行（和同一拍里的「音源断供」）在串口上要阻塞 10ms 以上，
+ * 于是静音期间实际只有 199.8 包/秒。接收端按 200 包/秒消费，队列每秒被抽走
+ * 0.2 包，几分钟的暂停就把缓冲抽到 5 包左右，重新播放时余量很浅。
+ * 现在落后了照常补发，平均发包率才是严格的 200 包/秒。 */
+#define ALINK_TX_CATCHUP_PKTS   10      /* 最多补这么多拍（50ms）；拖得更久才重新起拍 */
+#define ALINK_TX_MIN_GAP_US     2500    /* 追发时两包之间的最小间隔 */
+
 /* 主机音量 → 线性增益（Q16）。65536 = 0dB = 不改变。
  *
  * 为什么要在这里做：老哥这版 UAC 的 set_volume_cb 只打了一条日志，
@@ -399,6 +409,7 @@ static void tx_task(void *arg)
      * 只是包在驱动里排队。固件只数了次数没记错误码，事后分不清是队列满还是别的原因。 */
     esp_err_t send_err   = ESP_OK;    /* 最近一次失败的错误码 */
     uint32_t drop_logged = 0;         /* 上一次报失败告警时的 dropped，用来限频 */
+    int64_t last_send_us = 0;         /* 上一次 esp_now_send 的时刻，断供态追发时限速用 */
     int64_t t_prev = esp_timer_get_time();
     int64_t gap_min = 1 << 30, gap_max = 0, gap_sum = 0;
     uint32_t gap_n = 0;
@@ -436,12 +447,19 @@ static void tx_task(void *arg)
                 s_starve_grid = 0;        /* 有数据的状态不在节拍上 */
             } else {
                 /* 断供态按绝对节拍排队（见 s_starve_grid）。刚从 30ms 窗口切过来，
-                 * 或上一拍已经拖过下一个格点，就重新起拍 —— 不为了追格点连发。 */
-                if (s_starve_grid == 0 || now - s_starve_grid >= ALINK_PKT_MS * 1000) {
+                 * 或者这一拍被拖得太久（超过 ALINK_TX_CATCHUP_PKTS 拍），才重新起拍；
+                 * 落后的格点照常补发 —— 重新起拍等于少发静音包，接收端的缓冲会被抽浅。 */
+                if (s_starve_grid == 0 ||
+                    now - s_starve_grid >= ALINK_TX_CATCHUP_PKTS * ALINK_PKT_MS * 1000) {
                     s_starve_grid = now + ALINK_PKT_MS * 1000;
                 }
                 deadline      = s_starve_grid;
                 s_starve_grid += ALINK_PKT_MS * 1000;
+                /* 追发时两包之间至少隔 ALINK_TX_MIN_GAP_US：上一包 976 字节在 11Mbps 上
+                 * 要占约 1ms 空口，贴着发会堆在驱动里（入队被拒就是 ESP_ERR_ESPNOW_NO_MEM）。 */
+                if (deadline < last_send_us + ALINK_TX_MIN_GAP_US) {
+                    deadline = last_send_us + ALINK_TX_MIN_GAP_US;
+                }
             }
         }
 
@@ -618,6 +636,7 @@ static void tx_task(void *arg)
         }
 
         int64_t now = esp_timer_get_time();
+        last_send_us = now;
         int64_t gap = now - t_prev;
         t_prev = now;
         if (gap_n) {
