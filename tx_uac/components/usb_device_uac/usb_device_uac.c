@@ -115,14 +115,17 @@ static uint32_t s_diag_rx_n;
 
 /* SOF 回调，跑在 USB 任务里，每毫秒一次。正常情况下相邻两次间隔 1ms；
  * 超过 1.5ms 说明 USB 任务（或它依赖的 USB 中断）被卡住了一帧以上。 */
+/* 上一毫秒 SOF 回调的时刻，0 = 还没有基准。挂载、挂起、恢复时清零：
+ * 电脑睡眠或重插线之后 SOF 重新开始，第一次的间隔没有意义，不算迟到。 */
+static int64_t s_sof_prev_us;
+
 void tud_sof_cb(uint32_t frame_count)
 {
-    static int64_t t_prev = 0;
     const int64_t now = esp_timer_get_time();
     g_uac_diag.sof_frame = frame_count;
     g_uac_diag.sof_cnt++;
-    if (t_prev) {
-        const int64_t gap = now - t_prev;
+    if (s_sof_prev_us) {
+        const int64_t gap = now - s_sof_prev_us;
         if (gap > 1500) {
             g_uac_diag.late_cnt++;
             if (gap > g_uac_diag.late_max_us) {
@@ -131,7 +134,7 @@ void tud_sof_cb(uint32_t frame_count)
             uac_diag_event(3, now);
         }
     }
-    t_prev = now;
+    s_sof_prev_us = now;
 }
 
 static void usb_phy_init(void)
@@ -165,6 +168,7 @@ void tud_mount_cb(void)
     /* 【本工程补丁】诊断要用帧号判断「缺帧」，打开给应用层的 SOF 回调。
      * 组件自己用的 FIFO_COUNT 反馈算法不需要 SOF，所以原版没开。 */
     tud_sof_cb_enable(true);
+    s_sof_prev_us = 0;
 }
 
 // Invoked when device is unmounted
@@ -182,12 +186,14 @@ void tud_suspend_cb(bool remote_wakeup_en)
     s_uac_device->spk_active = false;
     s_uac_device->mic_active = false;
     ESP_LOGI(TAG, "USB suspended");
+    s_sof_prev_us = 0;             /*!< 【本工程补丁】恢复后第一次 SOF 间隔不算迟到 */
 }
 
 // Invoked when usb bus is resumed
 void tud_resume_cb(void)
 {
     ESP_LOGI(TAG, "USB resumed");
+    s_sof_prev_us = 0;             /*!< 【本工程补丁】同上 */
 }
 #endif
 
@@ -473,7 +479,7 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
     if (now - last_time > 100 * CONFIG_UAC_SPK_NEW_PLAY_INTERVAL) {
         new_play = true;
         tud_audio_n_clear_ep_out_ff(func_id);
-        g_uac_diag.flush_cnt++;
+        g_uac_diag.flush_cnt++;    /* 开流、关流再开流都会走到这里，是正常动作，不算少包 */
     }
     last_time = now;
 

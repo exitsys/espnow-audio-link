@@ -386,7 +386,10 @@ static void tone_start(void)
  * 接收端队列从 20 包被抽到见底。只看「UAC=… B/s」分不清少掉的是主机没发
  * （零长包、整帧没有数据），还是丢在本机（USB 任务迟到没接住、单缓冲被覆盖）。
  * 组件在每一包进来时记了几个数，这里在每次统计行之后看一遍增量；
- * 平时这些数不动，不打日志。 */
+ * 平时这些数不动，不打日志。
+ *
+ * 「清 FIFO」不算：流关闭再打开时组件本来就会清一次（攒到水位线再起播），
+ * 算进去的话每次重新开流都要误报一行。 */
 #if ALINK_TX_USE_UAC
 static void usb_diag_report(void)
 {
@@ -416,8 +419,8 @@ static void usb_diag_report(void)
         ESP_LOGI(TAG, "USB 诊断：零长 %lu，缺帧 %lu，迟到 %lu（最长 %ld us），收包最大间隔 %ld us",
                  (unsigned long)zlp, (unsigned long)skip, (unsigned long)late,
                  (long)late_max, (long)rx_gap_max);
-    } else if (dzlp || dskip || dlate || dwait || dflush) {
-        ESP_LOGW(TAG, "USB 少包：零长 +%lu，缺帧 +%lu，迟到 +%lu，没取走 +%lu，清FIFO +%lu；"
+    } else if (dzlp || dskip || dlate || dwait) {
+        ESP_LOGW(TAG, "USB 异常：零长 +%lu，缺帧 +%lu，迟到 +%lu，没取走 +%lu，清FIFO +%lu；"
                       "发生时本机正在发包 %lu 次、正在打印 %lu 次；收包最大间隔 %ld us",
                  (unsigned long)dzlp, (unsigned long)dskip, (unsigned long)dlate,
                  (unsigned long)dwait, (unsigned long)dflush,
