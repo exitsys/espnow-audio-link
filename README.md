@@ -34,6 +34,7 @@
 | **设备侧延时** | **约 95 ms** = 队列 75 + DMA 15 + 空口/拼包 5 |
 | 端到端（接 PC） | 约 120 ms（+ WASAPI 25 ms、USB 2 ms） |
 | 稳态表现 | 连续 100 秒：欠载 0、补位 0、波形跳变 0、重采样 0.00% |
+| 静音期间 | 发射端补位包 200 包/秒，接收端欠载 0（2026-11-25 上板实测；改动前是 166 包/秒、每秒欠载 33 次） |
 | 重采样 | 32 抽头多相 sinc，稳态精确直通（零插值） |
 
 ## 工作原理
@@ -165,6 +166,7 @@ cd rx_uac && idf.py menuconfig
 | `ALINK_TARGET_Q` / `ALINK_Q_HIGH` / `ALINK_Q_DEPTH` | `components/alink_common/include/alink_common.h` |
 | `ALINK_SRC_DEADBAND` / P 控制增益 / `I2S_DMA_DESC` | `rx_uac/main/alink_rx.c` |
 | 淡入淡出长度 / 时钟重配淡出包数 | `components/alink_common/include/alink_common.h` |
+| 信道 `ALINK_WIFI_CHANNEL` | `components/alink_common/include/alink_common.h` |
 
 档位对照、每个参数的副作用、踩过的坑，都在 **[TUNING.md](TUNING.md)**。
 
@@ -175,6 +177,7 @@ cd rx_uac && idf.py menuconfig
 - **一对一的单播链路**：没有配对流程，靠 MAC 识别对端；不支持一对多或漫游
 - **48 kHz / 16 bit 固定格式**：声卡只向主机声明 48 kHz 这一个采样率，44.1 kHz 的音源由主机（Windows / Android 的混音器）重采样成 48 kHz 再送过来，链路本身不会遇到 44.1 kHz。接收端的 I2S 时钟跟随针对的是「非标准的 48k」—— 比如实测送 47.93 kHz 的电视盒子：连续两个 30 秒窗口测出差 60 Hz 以上才重配，期间有 30 ms 淡出 + 15 ms 淡入（听感上是一次极短的停顿）
 - **无加密**：ESP-NOW 明文单播，同信道且知道 MAC 的设备可以抓包，只适合自家局域网环境。接收端可以在 menuconfig 里填发射端 MAC 做白名单，挡住别的设备往音箱里灌音频（见「限定发送端」）；白名单不加密，同信道的设备仍然能听到音频
+- **固定信道，受周围 WiFi 影响**：ESP-NOW 和别的网络抢同一个信道的空口。相邻信道上有强信号、或者有人在大量传数据时，帧会排在发射端的驱动里发不出去，听感是几秒的卡顿后自行恢复（详见 TUNING.md 坑 13）。想知道周围的占用情况，把 `rx_uac/main/alink_rx.c` 里的 `ALINK_WIFI_SCAN` 设为 1 烧一次，接收端启动时会把每个信道上的 AP 列出来，看完改回 0
 - **只在 ESP32-S3 上验证**：C3 单核 160 MHz 理论上能跑同一套算法（这段代码最早就是在 C3 上写的），但本版有 4 处 S3 硬编码（时钟源、核绑定、引脚、目标芯片），未做适配
 
 ## 许可与致谢
