@@ -11,6 +11,10 @@
  *   1. tud_audio_set_itf_cb：去掉 USB 中断上下文里的 printf。
  *   2. tud_audio_rx_done_isr：反馈值固定为标称速率，不再交给 TinyUSB 的
  *      FIFO_COUNT 算法；只读走 FIFO 半满线以上的数据，水位线按帧长对齐。
+ *   3. tud_audio_rx_done_isr：上一块数据没被 usb_spk_task 取走时先不读，
+ *      留在 FIFO 里等下一次（原版会覆盖，丢 1ms 音频）。
+ *   4. usb_device_uac.h 的 uac_diag_t：每一包进来时记几个数，用来判断
+ *      「音频少了」是主机没发还是丢在本机。为了拿到帧号，挂载后打开 SOF 回调。
  */
 
 #include <string.h>
@@ -81,6 +85,55 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 #define UAC_ENTER_CRITICAL()    portENTER_CRITICAL(&s_mux)
 #define UAC_EXIT_CRITICAL()     portEXIT_CRITICAL(&s_mux)
 
+/* 【本工程补丁】USB 级诊断计数，字段含义见 usb_device_uac.h 的 uac_diag_t。 */
+uac_diag_t g_uac_diag;
+
+/* 记一次异常：时刻（开机起的毫秒数）和种类，只留最近 8 次。
+ * 零长和缺帧发生时顺便记下本机当时是不是正在发 ESP-NOW（mark_rf_us 在 1.5ms 内）
+ * 或者应用层正在打印 —— 用来排除自身射频干扰和串口阻塞这两种本机原因。 */
+static void uac_diag_event(uint8_t kind, int64_t now)
+{
+    uac_diag_t *d = &g_uac_diag;
+    if (kind == 1 || kind == 2) {
+        if (d->mark_rf_us != 0 && now - d->mark_rf_us < 1500000) {
+            d->hit_rf_cnt++;
+        }
+        if (d->mark_log_us != 0 && now >= d->mark_log_us && now <= d->mark_log_end_us) {
+            d->hit_log_cnt++;
+        }
+    }
+    d->evt_ms[d->evt_i]   = (uint32_t)(now / 1000);
+    d->evt_kind[d->evt_i] = kind;
+    d->evt_i = (uint8_t)((d->evt_i + 1) % TU_ARRAY_SIZE(d->evt_ms));
+}
+
+/* 缺帧统计的累加状态（见 tud_audio_rx_done_isr），流重新开始时清零。 */
+static int64_t  s_diag_prev_us;
+static uint32_t s_diag_prev_frm;
+static uint32_t s_diag_df_acc;
+static uint32_t s_diag_rx_n;
+
+/* SOF 回调，跑在 USB 任务里，每毫秒一次。正常情况下相邻两次间隔 1ms；
+ * 超过 1.5ms 说明 USB 任务（或它依赖的 USB 中断）被卡住了一帧以上。 */
+void tud_sof_cb(uint32_t frame_count)
+{
+    static int64_t t_prev = 0;
+    const int64_t now = esp_timer_get_time();
+    g_uac_diag.sof_frame = frame_count;
+    g_uac_diag.sof_cnt++;
+    if (t_prev) {
+        const int64_t gap = now - t_prev;
+        if (gap > 1500) {
+            g_uac_diag.late_cnt++;
+            if (gap > g_uac_diag.late_max_us) {
+                g_uac_diag.late_max_us = (int32_t)gap;
+            }
+            uac_diag_event(3, now);
+        }
+    }
+    t_prev = now;
+}
+
 static void usb_phy_init(void)
 {
     // Configure USB PHY
@@ -109,6 +162,9 @@ void tud_mount_cb(void)
     s_uac_device->spk_active = false;
     s_uac_device->mic_active = false;
     ESP_LOGI(TAG, "USB mounted");
+    /* 【本工程补丁】诊断要用帧号判断「缺帧」，打开给应用层的 SOF 回调。
+     * 组件自己用的 FIFO_COUNT 反馈算法不需要 SOF，所以原版没开。 */
+    tud_sof_cb_enable(true);
 }
 
 // Invoked when device is unmounted
@@ -326,6 +382,7 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
         TU_LOG2("Speaker interface closed");
         s_uac_device->spk_data_size = 0;
         s_uac_device->spk_active = false;
+        s_diag_prev_us = 0;          /*!< 关流到再开流之间的帧不算缺帧 */
     }
 #endif
 
@@ -351,6 +408,9 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 #if SPEAK_CHANNEL_NUM
     if (s_uac_device->spk_itf_num == itf && alt != 0) {
         s_uac_device->spk_data_size = 0;
+        s_diag_prev_us = 0;          /*!< 新的一次流，缺帧统计从头算 */
+        s_diag_df_acc  = 0;
+        s_diag_rx_n    = 0;
         s_uac_device->spk_resolution = spk_resolutions_per_format[alt - 1];
         s_uac_device->spk_active = true;
         s_uac_device->spk_bytes_per_ms = s_uac_device->current_sample_rate / 1000 * SPEAK_CHANNEL_NUM * CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX;
@@ -413,8 +473,44 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
     if (now - last_time > 100 * CONFIG_UAC_SPK_NEW_PLAY_INTERVAL) {
         new_play = true;
         tud_audio_n_clear_ep_out_ff(func_id);
+        g_uac_diag.flush_cnt++;
     }
     last_time = now;
+
+    /* 【本工程补丁】USB 级诊断计数（见 usb_device_uac.h 的 uac_diag_t）。 */
+    {
+        uac_diag_t *d = &g_uac_diag;
+        const uint32_t frm = d->sof_frame;       /* 最近一次 SOF 回调的帧号，14 位回绕 */
+        d->rx_cnt++;
+        d->rx_bytes += n_bytes_received;
+        if (s_diag_prev_us) {
+            const int64_t gap = now - s_diag_prev_us;
+            if (gap > d->rx_gap_max_us) {
+                d->rx_gap_max_us = (int32_t)gap;
+            }
+            /* 累计算：从这一轮流的第一包算起，「帧号一共走了多少帧」减「收到了多少次 rx_done」，
+             * 就是没收到数据的帧数。不逐次判断「相邻帧号差是不是 2」：USB 任务偶尔迟到一帧时，
+             * 那一帧的数据会排到下一个 SOF 之后才处理，帧号差先少 1、下一次再多 1，
+             * 逐次判断会误报，累计算会抵消（中间结果可能是负的，所以用有符号数）。
+             * 帧号会回绕：全速是 11 位（每 2048 毫秒一圈，2026-11-26 上板时按 14 位算，
+             * 每圈误报一次），高速是 14 位的微帧号、一帧走 8 步。 */
+            const bool hs = (tud_speed_get() == TUSB_SPEED_HIGH);
+            const uint32_t df = (frm - s_diag_prev_frm) & (hs ? 0x3FFFu : 0x7FFu);
+            s_diag_df_acc += hs ? (df >> 3) : df;
+            s_diag_rx_n++;
+            const int32_t skip_now = (int32_t)((int64_t)s_diag_df_acc - (int64_t)s_diag_rx_n);
+            if (skip_now > 0 && (uint32_t)skip_now > d->skip_cnt) {
+                d->skip_cnt = (uint32_t)skip_now;
+                uac_diag_event(2, now);
+            }
+        }
+        s_diag_prev_frm = frm;
+        s_diag_prev_us  = now;
+        if (n_bytes_received == 0) {
+            d->zlp_cnt++;
+            uac_diag_event(1, now);
+        }
+    }
 
     int bytes_remained = tud_audio_n_available(func_id);
     const size_t bytes_per_ms = s_uac_device->spk_bytes_per_ms;
@@ -475,6 +571,15 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
      *
      *    修法：只读走超出目标水位的部分，把 FIFO 钉在半满，反馈才能稳在 48k。
      *    稳态下每包进 192、读 192，水位恒定在 level_set（884 字节，约 4.6ms）。 */
+    /*! 【本工程补丁】上一块还没被 usb_spk_task 取走时先不读。数据留在 USB FIFO 里
+     * （放得下 11ms），下一次 rx_done 再读。原版直接读进同一块 spk_buf，上一块没来得及
+     * 交给应用就被覆盖，那 1ms 音频无声无息地丢了 —— 应用层看到的「电脑少送了音频」
+     * 也可能是这么来的，所以同时计数。 */
+    if (s_uac_device->spk_data_size != 0) {
+        g_uac_diag.wait_cnt++;
+        return true;
+    }
+
     int over = bytes_remained - (int)level_set;
     if (over < (int)bytes_per_ms) {
         return true;        /*!< 还没攒够一包，等下一包。反馈看到水位低会催主机多发，正常 */

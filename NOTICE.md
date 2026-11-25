@@ -9,7 +9,8 @@ USB Audio Class 2 设备组件，来自 Espressif 的 [esp-iot-solution](https:/
 - 版权：Copyright 2023-2026 Espressif Systems (Shanghai) CO LTD
 - 组件目录里的 `CHECKSUMS.json` 是上游各文件的 SHA-256，可以用来核对哪些文件被改过
 
-本项目**只修改了其中一个文件**：`usb_device_uac.c`（文件头有改动声明，改动处都标了「本工程补丁」）。
+本项目**只修改了其中两个文件**：`usb_device_uac.c` 和 `include/usb_device_uac.h`
+（`usb_device_uac.c` 文件头有改动声明，改动处都标了「本工程补丁」）。
 
 1. `tud_audio_set_itf_cb`：删掉两处 `printf`。这个回调运行在 USB 中断上下文里，
    裸 `printf` 和 `ESP_LOG` 用的不是同一把 stdout 锁，混用会破坏日志输出，严重时让 USB 任务卡死。
@@ -21,6 +22,13 @@ USB Audio Class 2 设备组件，来自 Espressif 的 [esp-iot-solution](https:/
    起播前的等待水位也相应改成 `level_set`。
 4. `tud_audio_rx_done_isr`，**`level_set` 按帧长向下取整**，保证交给应用层的始终是整帧。
    不取整时首块是 266 字节（66 帧多 1 个样本），应用层在一次半包之后会左右声道错位。
+5. `tud_audio_rx_done_isr`，**上一块数据没被取走时先不读 FIFO**（2026-11-26）。
+   原版读进同一块 `spk_buf`，`usb_spk_task` 没来得及交给应用，下一次读就把上一块覆盖了，丢 1ms 音频。
+   现在数据留在 USB FIFO 里（放得下 11ms），等下一次再读。
+6. `usb_device_uac.h` 的 `uac_diag_t`、`tud_sof_cb`、`tud_mount_cb`：**USB 级诊断计数**（2026-11-26）。
+   每一包进来时记零长包、缺帧、USB 任务迟到等几个数，应用层有变化才打日志，
+   用来判断「音频少了」是主机没发还是丢在本机。为了拿帧号，挂载后打开了 TinyUSB 的 SOF 回调。
+   不影响音频通路。
 
 组件的其余文件与上游逐字节一致。音量的范围、步进，以及 `set_volume_cb` 的 0~100 映射，
 都是上游原有实现，本项目没有改。

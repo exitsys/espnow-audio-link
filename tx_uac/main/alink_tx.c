@@ -380,6 +380,66 @@ static void tone_start(void)
 
 /* ---------- 发送：数据驱动 ---------- */
 
+/* USB 级诊断（usb_device_uac.h 的 uac_diag_t）的变化，有变化才打一行。
+ *
+ * 2026-11-25 做信道对照时有一段录音里，电脑送来的音频在 32 秒里少了约 108 ms，
+ * 接收端队列从 20 包被抽到见底。只看「UAC=… B/s」分不清少掉的是主机没发
+ * （零长包、整帧没有数据），还是丢在本机（USB 任务迟到没接住、单缓冲被覆盖）。
+ * 组件在每一包进来时记了几个数，这里在每次统计行之后看一遍增量；
+ * 平时这些数不动，不打日志。 */
+#if ALINK_TX_USE_UAC
+static void usb_diag_report(void)
+{
+    static uint32_t prev_zlp, prev_skip, prev_late, prev_wait, prev_flush;
+    const uac_diag_t *d = &g_uac_diag;
+    /* 各字段分别读一次就用这一份：USB 任务随时在改，跨字段不追求严格一致，
+     * 但增量和「上一次的值」必须出自同一份，否则会漏计或重复计。 */
+    const uint32_t rx    = d->rx_cnt;
+    const uint32_t zlp   = d->zlp_cnt;
+    const uint32_t skip  = d->skip_cnt;
+    const uint32_t late  = d->late_cnt;
+    const uint32_t wait  = d->wait_cnt;
+    const uint32_t flush = d->flush_cnt;
+    const int32_t  late_max   = d->late_max_us;
+    const int32_t  rx_gap_max = d->rx_gap_max_us;
+    if (rx == 0) {
+        return;                                 /* 主机还没开始送 */
+    }
+    static uint32_t prev_rx;
+    const bool begin = (rx - prev_rx) < 500;    /* 这个窗口里不到半秒的包：刚开始流 */
+    const uint32_t dzlp = zlp - prev_zlp, dskip = skip - prev_skip, dlate = late - prev_late;
+    const uint32_t dwait = wait - prev_wait, dflush = flush - prev_flush;
+    prev_rx = rx; prev_zlp = zlp; prev_skip = skip; prev_late = late; prev_wait = wait; prev_flush = flush;
+
+    g_uac_diag.mark_log_us = esp_timer_get_time();
+    if (begin) {
+        ESP_LOGI(TAG, "USB 诊断：零长 %lu，缺帧 %lu，迟到 %lu（最长 %ld us），收包最大间隔 %ld us",
+                 (unsigned long)zlp, (unsigned long)skip, (unsigned long)late,
+                 (long)late_max, (long)rx_gap_max);
+    } else if (dzlp || dskip || dlate || dwait || dflush) {
+        ESP_LOGW(TAG, "USB 少包：零长 +%lu，缺帧 +%lu，迟到 +%lu，没取走 +%lu，清FIFO +%lu；"
+                      "发生时本机正在发包 %lu 次、正在打印 %lu 次；收包最大间隔 %ld us",
+                 (unsigned long)dzlp, (unsigned long)dskip, (unsigned long)dlate,
+                 (unsigned long)dwait, (unsigned long)dflush,
+                 (unsigned long)d->hit_rf_cnt, (unsigned long)d->hit_log_cnt, (long)rx_gap_max);
+        char buf[160];
+        int n = 0;
+        for (int k = 0; k < 8 && n < (int)sizeof(buf) - 20; k++) {
+            const uint8_t i = (uint8_t)((d->evt_i + k) % 8);
+            if (d->evt_kind[i] == 0) {
+                continue;
+            }
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%lu:%u", n ? " " : "",
+                          (unsigned long)d->evt_ms[i], (unsigned)d->evt_kind[i]);
+        }
+        if (n > 0) {
+            ESP_LOGW(TAG, "  最近异常（开机毫秒数:种类，1 零长 2 缺帧 3 迟到）%s", buf);
+        }
+    }
+    g_uac_diag.mark_log_end_us = esp_timer_get_time();
+}
+#endif  /* ALINK_TX_USE_UAC */
+
 /* 断供补位的包络状态（见 tx_task 里的「补位」段）。
  * s_gap_gain 是 Q8 增益：256 = 满幅，0 = 完全静音。
  * s_last_* 是上一个有效样本，衰减就从它开始，而不是从 0 开始 —— 从 0 开始
@@ -616,6 +676,9 @@ static void tx_task(void *arg)
         h->flags = pad_flag ? ALINK_FLAG_PAD : 0;
 
         const int pkt_len = ALINK_HDR_SIZE + ALINK_PAYLOAD_BYTES;
+#if ALINK_TX_USE_UAC
+        g_uac_diag.mark_rf_us = esp_timer_get_time();     /* USB 诊断用：记住发包时刻 */
+#endif
         /* 单播 + 硬件 ACK。发送失败（ACK 超时 / 队列满）只计数，不重发：
          * 重发会把这一包的发送时刻推后，反而制造抖动，交给接收端 PLC 补更划算。
          *
@@ -665,6 +728,7 @@ static void tx_task(void *arg)
             /* %lld 在 ESP_LOG 的 vsnprintf 路径上不可靠（实测会打出失控数据），
              * 全部改 %ld + (long) 强转；32 位平台上 int64 截断不影响这个量级。 */
 #if ALINK_TX_USE_UAC
+            g_uac_diag.mark_log_us = esp_timer_get_time(); /* USB 诊断用：统计行本身可能阻塞串口 */
             ESP_LOGI(TAG, "发=%lu(%lu/s) UAC=%lu B/s ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu UAC回调=%lu UAC丢=%lu 间隔 min/avg/max=%ld/%ld/%ld us 最近发送错误=%s",
                      (unsigned long)sent, (unsigned long)pps, (unsigned long)bps,
                      (unsigned long)aok, (unsigned long)(aok + afail),
@@ -674,6 +738,7 @@ static void tx_task(void *arg)
                      (unsigned long)s_uac_cb, (unsigned long)s_uac_drop,
                      (long)gap_min, (long)(gap_n > 1 ? gap_sum / (int64_t)(gap_n - 1) : 0), (long)gap_max,
                      esp_err_to_name(send_err));
+            g_uac_diag.mark_log_end_us = esp_timer_get_time();
 #else
             ESP_LOGI(TAG, "发=%lu(%lu/s) ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu 间隔 min/avg/max=%ld/%ld/%ld us 最近发送错误=%s",
                      (unsigned long)sent, (unsigned long)pps,
@@ -685,6 +750,9 @@ static void tx_task(void *arg)
                      esp_err_to_name(send_err));
 #endif
             gap_min = 1 << 30; gap_max = 0; gap_sum = 0; gap_n = 0;
+#if ALINK_TX_USE_UAC
+            usb_diag_report();
+#endif
         }
     }
 }
