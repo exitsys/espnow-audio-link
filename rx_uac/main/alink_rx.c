@@ -47,6 +47,7 @@
  * 所有断点（起播 / 丢包 / 补包 / 断流）统一走 2ms 交叉淡化，不再有阶跃。
  */
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
@@ -144,6 +145,19 @@ static const char *TAG = "alink_rx";
  * 定位完把这里改回 0，重新烧正常固件。 */
 #ifndef ALINK_PIN_SCAN
 #define ALINK_PIN_SCAN 0
+#endif
+
+/* 启动时扫一遍 2.4G（临时诊断用，正常固件保持 0）
+ *
+ * 2026-11-25 上板实测：链路偶尔出现几秒的「驱动发不出去 → 包成批迟到」——
+ * TX 侧 esp_now_send 报 ESP_ERR_ESPNOW_NO_MEM，RX 侧队列先被抽干、再被突发推到满。
+ * 空口上没丢包（ACK 100%），只是帧在等空口，怀疑信道 11 上有别的 WiFi 在占。
+ *
+ * 打开后接收端启动时先把周围的 AP 列一遍（信道、信号强度、SSID），
+ * 照着挑一个没人用的信道，改 ALINK_WIFI_CHANNEL。
+ * 扫描期间链路不通（约 3 秒），扫完照常工作。看完改回 0 重烧。 */
+#ifndef ALINK_WIFI_SCAN
+#define ALINK_WIFI_SCAN 0
 #endif
 
 /* DMA 深度直接决定「用户看不见的额外延迟」：i2s_channel_write 只要 DMA 有空位就
@@ -1371,6 +1385,49 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     xRingbufferSend(s_rb, data, (size_t)len, 0);
 }
 
+#if ALINK_WIFI_SCAN
+/* 扫一遍 2.4G，把每个 AP 和每个信道的汇总打进日志。只在诊断固件里编译。 */
+static void wifi_scan_print(void)
+{
+    const wifi_scan_config_t cfg = { .show_hidden = true };
+    const esp_err_t r = esp_wifi_scan_start(&cfg, true);
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi 扫描失败 %s", esp_err_to_name(r));
+        return;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    wifi_ap_record_t *rec = calloc(n ? n : 1, sizeof(*rec));
+    if (!rec) {
+        return;
+    }
+    uint16_t got = n;
+    esp_wifi_scan_get_ap_records(&got, rec);
+
+    int cnt[14] = { 0 }, strongest[14] = { 0 };
+    ESP_LOGW(TAG, "==== 2.4G 扫描：%d 个 AP ====", got);
+    for (uint16_t i = 0; i < got; i++) {
+        const int c = rec[i].primary;
+        ESP_LOGW(TAG, "  信道 %2d  %4d dBm  " MACSTR "  %s",
+                 c, rec[i].rssi, MAC2STR(rec[i].bssid),
+                 rec[i].ssid[0] ? (const char *)rec[i].ssid : "(隐藏)");
+        if (c >= 1 && c <= 13) {
+            if (cnt[c]++ == 0 || rec[i].rssi > strongest[c]) {
+                strongest[c] = rec[i].rssi;
+            }
+        }
+    }
+    for (int c = 1; c <= 13; c++) {
+        if (cnt[c]) {
+            ESP_LOGW(TAG, "  汇总 信道 %2d：%d 个 AP，最强 %d dBm", c, cnt[c], strongest[c]);
+        }
+    }
+    ESP_LOGW(TAG, "==== 扫描结束（本链路用的是信道 %d）====", ALINK_WIFI_CHANNEL);
+    free(rec);
+    esp_wifi_clear_ap_list();
+}
+#endif
+
 static void wifi_espnow_init(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -1387,6 +1444,9 @@ static void wifi_espnow_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+#if ALINK_WIFI_SCAN
+    wifi_scan_print();
+#endif
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));       /* 关省电，这项最能压延迟 */
     ESP_ERROR_CHECK(esp_wifi_set_channel(ALINK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(56));        /* 14 dBm */

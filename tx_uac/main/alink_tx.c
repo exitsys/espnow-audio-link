@@ -394,6 +394,11 @@ static void tx_task(void *arg)
     uint8_t *pcm = pkt + ALINK_HDR_SIZE;
 
     uint32_t sent = 0, dropped = 0, starve = 0, shortread = 0, misalign = 0;
+    /* 发送失败的错误码。2026-11-25 上板时出现过一次：刷完固件后的头两分钟里
+     * esp_now_send 连续报错 1209 次，ACK 却是 100%，接收端看到的是成批迟到 —— 空口没丢包，
+     * 只是包在驱动里排队。固件只数了次数没记错误码，事后分不清是队列满还是别的原因。 */
+    esp_err_t send_err   = ESP_OK;    /* 最近一次失败的错误码 */
+    uint32_t drop_logged = 0;         /* 上一次报失败告警时的 dropped，用来限频 */
     int64_t t_prev = esp_timer_get_time();
     int64_t gap_min = 1 << 30, gap_max = 0, gap_sum = 0;
     uint32_t gap_n = 0;
@@ -594,9 +599,20 @@ static void tx_task(void *arg)
 
         const int pkt_len = ALINK_HDR_SIZE + ALINK_PAYLOAD_BYTES;
         /* 单播 + 硬件 ACK。发送失败（ACK 超时 / 队列满）只计数，不重发：
-         * 重发会把这一包的发送时刻推后，反而制造抖动，交给接收端 PLC 补更划算。 */
-        if (esp_now_send(s_peer, pkt, pkt_len) != ESP_OK) {
+         * 重发会把这一包的发送时刻推后，反而制造抖动，交给接收端 PLC 补更划算。
+         *
+         * esp_now_send 只负责把包交给驱动入队，入队被拒几乎都是驱动队列满
+         * （ESP_ERR_ESPNOW_NO_MEM，IDF 文档的原话是「过一会儿再发」）。它成串出现，
+         * 说明空口或对端有一段时间收不过来，包成批压在驱动里、再成批到达。 */
+        const esp_err_t se = esp_now_send(s_peer, pkt, pkt_len);
+        if (se != ESP_OK) {
             dropped++;
+            send_err = se;
+            if (dropped - drop_logged >= 100) {
+                drop_logged = dropped;
+                ESP_LOGW(TAG, "esp_now_send 失败 %s（累计 %lu 次）",
+                         esp_err_to_name(se), (unsigned long)dropped);
+            }
         } else {
             sent++;
         }
@@ -630,22 +646,24 @@ static void tx_task(void *arg)
             /* %lld 在 ESP_LOG 的 vsnprintf 路径上不可靠（实测会打出失控数据），
              * 全部改 %ld + (long) 强转；32 位平台上 int64 截断不影响这个量级。 */
 #if ALINK_TX_USE_UAC
-            ESP_LOGI(TAG, "发=%lu(%lu/s) UAC=%lu B/s ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu UAC回调=%lu UAC丢=%lu 间隔 min/avg/max=%ld/%ld/%ld us",
+            ESP_LOGI(TAG, "发=%lu(%lu/s) UAC=%lu B/s ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu UAC回调=%lu UAC丢=%lu 间隔 min/avg/max=%ld/%ld/%ld us 最近发送错误=%s",
                      (unsigned long)sent, (unsigned long)pps, (unsigned long)bps,
                      (unsigned long)aok, (unsigned long)(aok + afail),
                      (double)ack_pct_x100 / 100.0,
                      (unsigned long)dropped,
                      (unsigned long)starve, (unsigned long)shortread,
                      (unsigned long)s_uac_cb, (unsigned long)s_uac_drop,
-                     (long)gap_min, (long)(gap_n > 1 ? gap_sum / (int64_t)(gap_n - 1) : 0), (long)gap_max);
+                     (long)gap_min, (long)(gap_n > 1 ? gap_sum / (int64_t)(gap_n - 1) : 0), (long)gap_max,
+                     esp_err_to_name(send_err));
 #else
-            ESP_LOGI(TAG, "发=%lu(%lu/s) ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu 间隔 min/avg/max=%ld/%ld/%ld us",
+            ESP_LOGI(TAG, "发=%lu(%lu/s) ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu 间隔 min/avg/max=%ld/%ld/%ld us 最近发送错误=%s",
                      (unsigned long)sent, (unsigned long)pps,
                      (unsigned long)aok, (unsigned long)(aok + afail),
                      (double)ack_pct_x100 / 100.0,
                      (unsigned long)dropped,
                      (unsigned long)starve, (unsigned long)shortread,
-                     (long)gap_min, (long)(gap_n > 1 ? gap_sum / (int64_t)(gap_n - 1) : 0), (long)gap_max);
+                     (long)gap_min, (long)(gap_n > 1 ? gap_sum / (int64_t)(gap_n - 1) : 0), (long)gap_max,
+                     esp_err_to_name(send_err));
 #endif
             gap_min = 1 << 30; gap_max = 0; gap_sum = 0; gap_n = 0;
         }
