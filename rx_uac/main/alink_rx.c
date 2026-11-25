@@ -607,6 +607,23 @@ static inline int32_t dither_tpdf(void)
  * 门槛提到稳态水位的代价是每次起播多 45ms 静音。 */
 #define ALINK_JITTER_PKTS (ALINK_TARGET_Q - (int)ALINK_SRC_DEADBAND)
 
+/* 低水位重缓冲（2026-11-26）：队列被抽到只剩 ALINK_Q_LOW 包时不再一包包硬撑 ——
+ * 按包线性淡出，然后退回预缓冲，等水位回到起播门槛再起播。
+ *
+ * 为什么不硬撑：P 控制回水很慢（增益 8，每秒约 0.13 包）。队列见底之后，只要包还在来，
+ * 下面那条「连续 40 包（200ms）全空才退回预缓冲」就一直不触发，系统会在 0~5 包上瘸一两分钟，
+ * 期间任何一点抖动都是一次欠载（PLC）。2026-11-26 注入音源短缺实测（70ms；再 60ms、
+ * 每秒 1 包×10、40ms）：TARGET_Q 18 欠载 18 次，20 也还有 14 次，录制结束时都没回到稳态。
+ *
+ * 改成「见底就干脆停一下」：代价是一次约 90ms 的停顿（15ms 淡出，加约 75ms 静音，
+ * 等水位回到起播门槛；起播时 15ms 长淡入），换来水位立刻回到稳态。数字静音期间这次停顿听不出来。
+ *
+ * 门槛必须低于电视盒子开机头 60 秒的稳态水位：盒子失配 0.146%，增益 8 下水位是
+ * TARGET_Q − 3 − 12 = 5 包（TARGET_Q 20），所以这里取 2，留 3 包给队列 ±1 的日常抖动。
+ * TARGET_Q 调低之前先重算这个数。 */
+#define ALINK_Q_LOW          2
+#define ALINK_LOW_FADE_PKTS  3       /* 淡出用几块（每块 5ms），最后一块的增益正好到 0 */
+
 /* polyphase windowed-sinc 插值器参数。
  *
  * 为什么不用 4 点三次 Hermite：上电自测（ALINK_SRC_DIAG）实测，
@@ -659,6 +676,9 @@ static volatile uint32_t s_i2s_rate = ALINK_I2S_RATE;
 static volatile int32_t  s_clk_req  = 0;     /* 非 0 = 请播放任务切到该采样率 */
 static int      s_clk_pending = 0;           /* 已接单、待切换的目标采样率，0 = 无 */
 static int      s_clk_fade    = 0;           /* >0 = 重配前还剩几包要淡出 */
+static int      s_low_fade    = 0;           /* >0 = 低水位淡出还剩几块要写（见 ALINK_Q_LOW） */
+static volatile bool s_low_done = false;     /* 淡出已经写完，播放任务该退回预缓冲了 */
+static volatile uint32_t s_low_rebuf = 0;    /* 低水位重缓冲的累计次数 */
 static uint32_t s_rate_frames = 0;           /* 测速窗口内累计到达帧数 */
 static int64_t  s_rate_t0     = 0;           /* 测速窗口起点 */
 static int      s_rate_prev   = 0;           /* 上一窗口测出的帧率，用于去抖 */
@@ -1323,6 +1343,22 @@ static void emit(const int16_t *src)
             s_clk_fade--;
         }
 
+        /* 低水位淡出（见 play_task 的「低水位重缓冲」）。斜坡做在块内：
+         * 只有三块，每块一个固定增益的话是三级 −3.5dB 的台阶。 */
+        if (s_low_fade > 0) {
+            const int32_t top = s_low_fade * 256 / ALINK_LOW_FADE_PKTS;        /* 这一块开头的增益 */
+            const int32_t bot = (s_low_fade - 1) * 256 / ALINK_LOW_FADE_PKTS;  /* 这一块结尾的增益 */
+            int16_t *p = &acc[0][0];
+            for (int i = 0; i < ALINK_FRAMES_PER_PKT; i++) {
+                const int32_t g = top + ((bot - top) * (i + 1)) / ALINK_FRAMES_PER_PKT;
+                p[2 * i]     = (int16_t)(((int32_t)p[2 * i] * g) >> 8);
+                p[2 * i + 1] = (int16_t)(((int32_t)p[2 * i + 1] * g) >> 8);
+            }
+            if (--s_low_fade == 0) {
+                s_low_done = true;
+            }
+        }
+
         size_t written = 0;
         const size_t want = (size_t)ALINK_FRAMES_PER_PKT * ALINK_CHANNELS * sizeof(int16_t);
         esp_err_t we = i2s_channel_write(s_i2s_tx, acc, want, &written, portMAX_DELAY);
@@ -1797,7 +1833,15 @@ static void rx_task(void *arg)
                     (int32_t)(s_dma_done * (uint32_t)ALINK_FRAMES_PER_PKT) -
                     (int32_t)s_out_frames;
 
-                ESP_LOGI(TAG, "包=%lu 丢=%lu(%.2f%%) 重复=%lu 补位=%lu 占位=%lu PLC=%lu 溢出=%lu 漂移丢=%lu 重采样=%+.2f%% I2S错=%lu 欠载=%lu 队列=%d(%d~%d) 输出=%.1f帧/秒 峰=%.1fdBFS RSSI=%d 跳变=%lu(边%lu/中%lu) 最大=%ld 零串=%lu帧(%lums) DMA余=%ld 相位钳=%lu 醒来=%lu",
+            /* 低水位重缓冲的事件行由这里报：播放任务发现时队列只剩 10ms，打不得日志。 */
+            static uint32_t low_seen = 0;
+            if (s_low_rebuf != low_seen) {
+                low_seen = s_low_rebuf;
+                ESP_LOGW(TAG, "队列只剩 %d 包（低水位），已淡出并重缓冲（累计 %lu 次）",
+                         ALINK_Q_LOW, (unsigned long)s_low_rebuf);
+            }
+
+            ESP_LOGI(TAG, "包=%lu 丢=%lu(%.2f%%) 重复=%lu 补位=%lu 占位=%lu PLC=%lu 溢出=%lu 漂移丢=%lu 重采样=%+.2f%% I2S错=%lu 欠载=%lu 重缓冲=%lu 队列=%d(%d~%d) 输出=%.1f帧/秒 峰=%.1fdBFS RSSI=%d 跳变=%lu(边%lu/中%lu) 最大=%ld 零串=%lu帧(%lums) DMA余=%ld 相位钳=%lu 醒来=%lu",
                          (unsigned long)got, (unsigned long)lost,
                          got ? lost * 100.0 / (got + lost) : 0.0,
                          (unsigned long)dup, (unsigned long)pad, (unsigned long)filled,
@@ -1806,7 +1850,7 @@ static void rx_task(void *arg)
                          (unsigned long)s_drift_drop,
                          (double)(s_src_ratio - 65536) * 100.0 / 65536.0,
                          (unsigned long)s_i2s_err,
-                         (unsigned long)s_underrun, q_depth(), s_q_min, s_q_max,
+                         (unsigned long)s_underrun, (unsigned long)s_low_rebuf, q_depth(), s_q_min, s_q_max,
                          out_rate, dbfs, rssi,
                          (unsigned long)(s_jump_edge + s_jump_mid),
                          (unsigned long)s_jump_edge, (unsigned long)s_jump_mid,
@@ -1831,6 +1875,7 @@ static void play_task(void *arg)
     static uint8_t pcm[ALINK_PAYLOAD_BYTES];
     bool started = false;
     bool is_fill = false;
+    bool rebuf = false;         /* 上一次停播是低水位重缓冲：起播时要走长淡入 */
     float ema = 0.0f;
     uint32_t starve = 0;
 
@@ -1896,12 +1941,38 @@ static void play_task(void *arg)
                  * 之下，闭环会先把重采样比压到 1 以下，平白多出一段插值。 */
                 ema = (float)d;
                 s_xfade = true;
+                /* 低水位淡出可能还剩一两块没写（断流抢在前面把 started 清掉了，或者
+                 * 积压的包一下子涌上来），不清掉的话起播头两块会被压低甚至抹成静音。 */
+                s_low_fade = 0;
+                s_low_done = false;
+                if (rebuf) {
+                    /* 重缓冲之后接的是一段静音，从静音到满幅要走 15ms 长淡入（同断流恢复） */
+                    rebuf = false;
+                    s_fade_in_left = ALINK_FADE_IN_FRAMES;
+                }
                 ESP_LOGI(TAG, "起播 队列=%d", d);
             } else {
                 /* 预缓冲期间照常写静音，保持 I2S 时钟连续 —— 不写就会循环播旧数据 */
                 emit(NULL);
                 continue;
             }
+        }
+
+        /* ---- 低水位重缓冲（见 ALINK_Q_LOW）----
+         * 队列只剩 ALINK_Q_LOW 包：不再一包包硬撑，按块淡出，写完最后一块就退回预缓冲。
+         * 时钟重配自己有一段淡出，两段不叠在一起。
+         * 这里不打日志：队列只剩 10ms，一条日志在串口上就要 10ms；由统计任务报（见 stats）。 */
+        if (s_low_fade == 0 && s_low_done == false &&
+            s_clk_pending == 0 && s_clk_fade == 0 && d <= ALINK_Q_LOW) {
+            s_low_fade = ALINK_LOW_FADE_PKTS;
+            s_low_rebuf++;
+        }
+        if (s_low_done) {
+            s_low_done = false;
+            started = false;
+            starve   = 0;
+            rebuf    = true;
+            continue;               /* 下一轮走上面的预缓冲分支：写静音，等水位 */
         }
 
         /* ---- 水位闭环：连续调节重采样比 ----
