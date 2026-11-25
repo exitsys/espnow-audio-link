@@ -68,7 +68,10 @@
 #endif
 
 #if ALINK_LOW_LATENCY
-#define ALINK_TARGET_Q         18    /* 低延时档。时钟跟随生效后稳态在 TARGET − 死区 = 15 包 = 75ms */
+/* 2026-11-26 从 18 提到 20：给「电脑偶发少送音频」多留 10ms 余量（TUNING.md 坑 14）。
+ * 代价是延时也多 10ms。余量不够时只能加这里 —— 死区不能砍、增益不能提，
+ * 那两条都是实测出来的音质底线。 */
+#define ALINK_TARGET_Q         20    /* 低延时档。时钟跟随生效后稳态在 TARGET − 死区 = 17 包 = 85ms */
 #define ALINK_Q_HIGH           32    /* 真溢出兜底：EMA 高于此值且瞬时也高 → 丢整包 */
 #else
 #define ALINK_TARGET_Q         26    /* 稳定档。接盒子时实测稳在 11 包 = 55ms（见上面的稳态方程） */
