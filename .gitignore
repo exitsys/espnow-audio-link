@@ -1,6 +1,8 @@
 # ESP-IDF 构建产物
 build/
 managed_components/
+# 组件管理器的锁文件：会把本地组件的绝对路径写进去，每台机器都不一样，不入库
+dependencies.lock
 *.bin
 *.elf
 *.map

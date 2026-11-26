@@ -21,3 +21,10 @@ dependencies:
   espressif/usb_device_uac:
     version: "*"
     override_path: "../components/usb_device_uac"
+  ## 锁文件（dependencies.lock）不入库：组件管理器会把本地组件的绝对路径写进去，
+  ## 每台机器构建一次它都变，入库就会带着本机路径。原先由锁文件钉住的两个传递依赖，
+  ## 在这里钉成同一个版本（2026-11-26 之前实际用的就是这两个）。
+  espressif/tinyusb:
+    version: "0.19.0~3"
+  espressif/cmake_utilities:
+    version: "1.4.1"
