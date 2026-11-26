@@ -160,6 +160,18 @@ static void led_all_off(void)
 #define ALINK_TX_CATCHUP_PKTS   10      /* 最多补这么多拍（50ms）；拖得更久才重新起拍 */
 #define ALINK_TX_MIN_GAP_US     2500    /* 追发时两包之间的最小间隔 */
 
+/* 主机已经关流（USB 接口切回 alt 0）时，手头的半包最多再等这么久就发出去。
+ *
+ * 正常的 30ms 等待窗口是给「流还开着、数据晚到一点」用的，那种情况等一等就能无缝接上。
+ * 但切歌、暂停时主机会把流关掉再开，一等就是 30ms 以上：这 30ms 里空口上什么都没有，
+ * 接收端按 200 包/秒照常消费，队列每次被抽走 5~6 包。2026-11-26 上板实测，连着切歌
+ * 80 秒里 10 次关流，队列 16 → 11 → 6 → 1，三次见底。
+ * 流既然已经关了，再等也等不来数据，所以只留 5ms（给「关了马上又开」的抖动），然后转去发补位包。
+ * 流没关的时候的行为完全不变。 */
+#if ALINK_TX_USE_UAC
+#define ALINK_TX_CLOSE_WAIT_US  5000
+#endif
+
 /* 主机音量 → 线性增益（Q16）。65536 = 0dB = 不改变。
  *
  * 为什么要在这里做：老哥这版 UAC 的 set_volume_cb 只打了一条日志，
@@ -382,48 +394,60 @@ static void tone_start(void)
 
 /* USB 级诊断（usb_device_uac.h 的 uac_diag_t）的变化，有变化才打一行。
  *
- * 2026-11-25 做信道对照时有一段录音里，电脑送来的音频在 32 秒里少了约 108 ms，
+ * 2026-11-25 做信道对照时有一段录音里，电脑送来的音频在 32 秒里少了约 104 ms，
  * 接收端队列从 20 包被抽到见底。只看「UAC=… B/s」分不清少掉的是主机没发
- * （零长包、整帧没有数据），还是丢在本机（USB 任务迟到没接住、单缓冲被覆盖）。
+ * （零长包、短包、整帧没有数据），还是丢在本机（USB 任务迟到没接住、单缓冲被覆盖）。
  * 组件在每一包进来时记了几个数，这里在每次统计行之后看一遍增量；
  * 平时这些数不动，不打日志。
  *
- * 「清 FIFO」不算：流关闭再打开时组件本来就会清一次（攒到水位线再起播），
- * 算进去的话每次重新开流都要误报一行。 */
+ * 「清 FIFO」和开关流不算异常：流关闭再打开时组件本来就会清一次 FIFO（攒到水位线再起播），
+ * 算进去的话每次切歌都要误报一行。开关流的次数印在基线行和异常行里，方便对着看。 */
 #if ALINK_TX_USE_UAC
 static void usb_diag_report(void)
 {
-    static uint32_t prev_zlp, prev_skip, prev_late, prev_wait, prev_flush;
+    static uint32_t prev_rx, prev_zlp, prev_skip, prev_late, prev_wait;
+    static uint32_t prev_short, prev_sbytes, prev_open, prev_close;
     const uac_diag_t *d = &g_uac_diag;
     /* 各字段分别读一次就用这一份：USB 任务随时在改，跨字段不追求严格一致，
      * 但增量和「上一次的值」必须出自同一份，否则会漏计或重复计。 */
-    const uint32_t rx    = d->rx_cnt;
-    const uint32_t zlp   = d->zlp_cnt;
-    const uint32_t skip  = d->skip_cnt;
-    const uint32_t late  = d->late_cnt;
-    const uint32_t wait  = d->wait_cnt;
-    const uint32_t flush = d->flush_cnt;
+    const uint32_t rx     = d->rx_cnt;
+    const uint32_t zlp    = d->zlp_cnt;
+    const uint32_t skip   = d->skip_cnt;
+    const uint32_t late   = d->late_cnt;
+    const uint32_t wait   = d->wait_cnt;
+    const uint32_t shortp = d->short_cnt;
+    const uint32_t sbytes = d->short_bytes;
+    const uint32_t open   = d->open_cnt;
+    const uint32_t close  = d->close_cnt;
     const int32_t  late_max   = d->late_max_us;
     const int32_t  rx_gap_max = d->rx_gap_max_us;
-    if (rx == 0) {
-        return;                                 /* 主机还没开始送 */
+    if (rx == prev_rx) {
+        return;                                 /* 主机还没开始送，或者流已经关了：这个窗口没有包进来 */
     }
-    static uint32_t prev_rx;
-    const bool begin = (rx - prev_rx) < 500;    /* 这个窗口里不到半秒的包：刚开始流 */
-    const uint32_t dzlp = zlp - prev_zlp, dskip = skip - prev_skip, dlate = late - prev_late;
-    const uint32_t dwait = wait - prev_wait, dflush = flush - prev_flush;
-    prev_rx = rx; prev_zlp = zlp; prev_skip = skip; prev_late = late; prev_wait = wait; prev_flush = flush;
+    /* 这个窗口里不到半秒的包：刚开始流，或者刚关流再开（切歌）。这时增量没有意义，打基线。
+     * 流关着的时候 rx 不变，上面已经返回了 —— 否则关流期间每 2 秒都要重复打一遍基线。 */
+    const bool begin = (rx - prev_rx) < 500;
+    const uint32_t dzlp   = zlp - prev_zlp,     dskip = skip - prev_skip, dlate = late - prev_late;
+    const uint32_t dwait  = wait - prev_wait,   dshort = shortp - prev_short;
+    const uint32_t dsbyte = sbytes - prev_sbytes;
+    const uint32_t dopen  = open - prev_open,   dclose = close - prev_close;
+    prev_rx = rx; prev_zlp = zlp; prev_skip = skip; prev_late = late; prev_wait = wait;
+    prev_short = shortp; prev_sbytes = sbytes; prev_open = open; prev_close = close;
 
     g_uac_diag.mark_log_us = esp_timer_get_time();
     if (begin) {
-        ESP_LOGI(TAG, "USB 诊断：零长 %lu，缺帧 %lu，迟到 %lu（最长 %ld us），收包最大间隔 %ld us",
-                 (unsigned long)zlp, (unsigned long)skip, (unsigned long)late,
-                 (long)late_max, (long)rx_gap_max);
-    } else if (dzlp || dskip || dlate || dwait) {
-        ESP_LOGW(TAG, "USB 异常：零长 +%lu，缺帧 +%lu，迟到 +%lu，没取走 +%lu，清FIFO +%lu；"
-                      "发生时本机正在发包 %lu 次、正在打印 %lu 次；收包最大间隔 %ld us",
-                 (unsigned long)dzlp, (unsigned long)dskip, (unsigned long)dlate,
-                 (unsigned long)dwait, (unsigned long)dflush,
+        ESP_LOGI(TAG, "USB 诊断：零长 %lu，短包 %lu（少 %lu 字节），缺帧 %lu，迟到 %lu（最长 %ld us），"
+                      "收包最大间隔 %ld us；开流 %lu 次、关流 %lu 次",
+                 (unsigned long)zlp, (unsigned long)shortp, (unsigned long)sbytes,
+                 (unsigned long)skip, (unsigned long)late, (long)late_max, (long)rx_gap_max,
+                 (unsigned long)open, (unsigned long)close);
+    } else if (dzlp || dskip || dlate || dwait || dshort) {
+        ESP_LOGW(TAG, "USB 异常：零长 +%lu，短包 +%lu（少 %lu 字节），缺帧 +%lu，迟到 +%lu，没取走 +%lu；"
+                      "开流 +%lu，关流 +%lu；零长 / 短包 / 缺帧发生时本机正在发包 %lu 次、"
+                      "正在打印 %lu 次（这两项是累计）；收包最大间隔 %ld us",
+                 (unsigned long)dzlp, (unsigned long)dshort, (unsigned long)dsbyte,
+                 (unsigned long)dskip, (unsigned long)dlate, (unsigned long)dwait,
+                 (unsigned long)dopen, (unsigned long)dclose,
                  (unsigned long)d->hit_rf_cnt, (unsigned long)d->hit_log_cnt, (long)rx_gap_max);
         char buf[160];
         int n = 0;
@@ -436,7 +460,7 @@ static void usb_diag_report(void)
                           (unsigned long)d->evt_ms[i], (unsigned)d->evt_kind[i]);
         }
         if (n > 0) {
-            ESP_LOGW(TAG, "  最近异常（开机毫秒数:种类，1 零长 2 缺帧 3 迟到）%s", buf);
+            ESP_LOGW(TAG, "  最近异常（开机毫秒数:种类，1 零长 2 缺帧 3 迟到 4 开流 5 关流 6 短包）%s", buf);
         }
     }
     g_uac_diag.mark_log_end_us = esp_timer_get_time();
@@ -507,6 +531,11 @@ static void tx_task(void *arg)
             const int64_t now = esp_timer_get_time();
             if (!s_starving) {
                 deadline      = now + 30000;
+#if ALINK_TX_USE_UAC
+                if (!g_uac_spk_stream_on) {
+                    deadline = now + ALINK_TX_CLOSE_WAIT_US;     /* 主机已经关流，见 ALINK_TX_CLOSE_WAIT_US */
+                }
+#endif
                 s_starve_grid = 0;        /* 有数据的状态不在节拍上 */
             } else {
                 /* 断供态按绝对节拍排队（见 s_starve_grid）。刚从 30ms 窗口切过来，
@@ -528,6 +557,12 @@ static void tx_task(void *arg)
 
         while (total < ALINK_PAYLOAD_BYTES) {
             const int64_t now = esp_timer_get_time();
+#if ALINK_TX_USE_UAC
+            /* 等的过程中主机把流关了（最多 2ms 后在这里发现）：同样不再等满 30ms */
+            if (!s_starving && !g_uac_spk_stream_on && deadline > now + ALINK_TX_CLOSE_WAIT_US) {
+                deadline = now + ALINK_TX_CLOSE_WAIT_US;
+            }
+#endif
             if (now >= deadline) {
                 break;
             }

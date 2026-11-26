@@ -15,6 +15,8 @@
  *      留在 FIFO 里等下一次（原版会覆盖，丢 1ms 音频）。
  *   4. usb_device_uac.h 的 uac_diag_t：每一包进来时记几个数，用来判断
  *      「音频少了」是主机没发还是丢在本机。为了拿到帧号，挂载后打开 SOF 回调。
+ *   5. g_uac_spk_stream_on（usb_device_uac.h）：开流 / 关流时置位，应用层的发送任务
+ *      据此在关流时不再等满 30ms 才发补位包。
  */
 
 #include <string.h>
@@ -87,6 +89,7 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* 【本工程补丁】USB 级诊断计数，字段含义见 usb_device_uac.h 的 uac_diag_t。 */
 uac_diag_t g_uac_diag;
+volatile bool g_uac_spk_stream_on = false;
 
 /* 记一次异常：时刻（开机起的毫秒数）和种类，只留最近 8 次。
  * 零长和缺帧发生时顺便记下本机当时是不是正在发 ESP-NOW（mark_rf_us 在 1.5ms 内）
@@ -94,7 +97,7 @@ uac_diag_t g_uac_diag;
 static void uac_diag_event(uint8_t kind, int64_t now)
 {
     uac_diag_t *d = &g_uac_diag;
-    if (kind == 1 || kind == 2) {
+    if (kind == 1 || kind == 2 || kind == 6) {
         if (d->mark_rf_us != 0 && now - d->mark_rf_us < 1500000) {
             d->hit_rf_cnt++;
         }
@@ -164,6 +167,7 @@ void tud_mount_cb(void)
 {
     s_uac_device->spk_active = false;
     s_uac_device->mic_active = false;
+    g_uac_spk_stream_on = false;
     ESP_LOGI(TAG, "USB mounted");
     /* 【本工程补丁】诊断要用帧号判断「缺帧」，打开给应用层的 SOF 回调。
      * 组件自己用的 FIFO_COUNT 反馈算法不需要 SOF，所以原版没开。 */
@@ -185,6 +189,7 @@ void tud_suspend_cb(bool remote_wakeup_en)
     (void)remote_wakeup_en;
     s_uac_device->spk_active = false;
     s_uac_device->mic_active = false;
+    g_uac_spk_stream_on = false;
     ESP_LOGI(TAG, "USB suspended");
     s_sof_prev_us = 0;             /*!< 【本工程补丁】恢复后第一次 SOF 间隔不算迟到 */
 }
@@ -389,6 +394,10 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
         s_uac_device->spk_data_size = 0;
         s_uac_device->spk_active = false;
         s_diag_prev_us = 0;          /*!< 关流到再开流之间的帧不算缺帧 */
+        /* 【本工程补丁】告诉应用层：流关了，别再等数据（见 usb_device_uac.h） */
+        g_uac_spk_stream_on = false;
+        g_uac_diag.close_cnt++;
+        uac_diag_event(5, esp_timer_get_time());
     }
 #endif
 
@@ -415,6 +424,9 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     if (s_uac_device->spk_itf_num == itf && alt != 0) {
         s_uac_device->spk_data_size = 0;
         s_diag_prev_us = 0;          /*!< 新的一次流，缺帧统计从头算 */
+        g_uac_spk_stream_on = true;  /*!< 【本工程补丁】见 usb_device_uac.h */
+        g_uac_diag.open_cnt++;
+        uac_diag_event(4, esp_timer_get_time());
         s_diag_df_acc  = 0;
         s_diag_rx_n    = 0;
         s_uac_device->spk_resolution = spk_resolutions_per_format[alt - 1];
@@ -515,6 +527,11 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
         if (n_bytes_received == 0) {
             d->zlp_cnt++;
             uac_diag_event(1, now);
+        } else if (n_bytes_received < s_uac_device->spk_bytes_per_ms) {
+            /* 有数据但不满一毫秒：主机这一帧没凑够样本 */
+            d->short_cnt++;
+            d->short_bytes += (uint32_t)(s_uac_device->spk_bytes_per_ms - n_bytes_received);
+            uac_diag_event(6, now);
         }
     }
 

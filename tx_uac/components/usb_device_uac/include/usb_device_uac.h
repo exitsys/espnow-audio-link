@@ -60,8 +60,13 @@ esp_err_t uac_device_init(uac_device_config_t *config);
  *   - wait_cnt  进 rx_done 时上一块数据还没被取走，这次没读 FIFO
  *   - hit_rf_cnt / hit_log_cnt  零长或缺帧发生时，本机 1.5ms 内发过 ESP-NOW /
  *               应用层正在打印的次数（用来排除自身射频干扰和串口阻塞）
- * evt_* 是最近 8 次异常：开机起的毫秒数和种类（1 零长 2 缺帧 3 迟到）。
+ *   - short_cnt / short_bytes  短包：有数据但不满一毫秒的标称字节数（192）。
+ *               流没断、字节却少了，是这种而不是零长或缺帧
+ *   - open_cnt / close_cnt     主机开流 / 关流的次数（接口的 alt 设置 0 ↔ 非 0）
+ * evt_* 是最近 8 次异常：开机起的毫秒数和种类
+ * （1 零长 2 缺帧 3 迟到 4 开流 5 关流 6 短包）。
  * mark_* 三个时刻由应用层写，只用于上面两个「同时」的判断。 */
+
 typedef struct {
     uint32_t sof_cnt;          /* SOF 回调次数，流没开的时候也是每毫秒一次 */
     uint32_t rx_cnt;           /* rx_done 次数 */
@@ -73,6 +78,10 @@ typedef struct {
     int32_t  rx_gap_max_us;    /* 相邻两次 rx_done 的最大间隔 */
     uint32_t flush_cnt;        /* 判成「新的播放」而清 FIFO 的次数 */
     uint32_t wait_cnt;
+    uint32_t short_cnt;
+    uint32_t short_bytes;
+    uint32_t open_cnt;
+    uint32_t close_cnt;
     uint32_t hit_rf_cnt;
     uint32_t hit_log_cnt;
     volatile int64_t mark_rf_us;
@@ -84,6 +93,11 @@ typedef struct {
     uint8_t  evt_i;
 } uac_diag_t;
 extern uac_diag_t g_uac_diag;
+
+/* 【本工程补丁】主机的音频流现在是不是开着（接口 alt 设置非 0）。
+ * USB 任务写，应用层的发送任务读。关流的时候发送任务不必再等满 30ms 才发补位包，
+ * 见 alink_tx.c 的 ALINK_TX_CLOSE_WAIT_US。 */
+extern volatile bool g_uac_spk_stream_on;
 
 #ifdef __cplusplus
 }

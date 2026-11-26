@@ -26,9 +26,12 @@ USB Audio Class 2 设备组件，来自 Espressif 的 [esp-iot-solution](https:/
    原版读进同一块 `spk_buf`，`usb_spk_task` 没来得及交给应用，下一次读就把上一块覆盖了，丢 1ms 音频。
    现在数据留在 USB FIFO 里（放得下 11ms），等下一次再读。
 6. `usb_device_uac.h` 的 `uac_diag_t`、`tud_sof_cb`、`tud_mount_cb`：**USB 级诊断计数**（2026-11-26）。
-   每一包进来时记零长包、缺帧、USB 任务迟到等几个数，应用层有变化才打日志，
-   用来判断「音频少了」是主机没发还是丢在本机。为了拿帧号，挂载后打开了 TinyUSB 的 SOF 回调。
-   不影响音频通路。
+   每一包进来时记零长包、短包、缺帧、USB 任务迟到等几个数，以及主机开流 / 关流的次数，
+   应用层有变化才打日志，用来判断「音频少了」是主机没发还是丢在本机。
+   为了拿帧号，挂载后打开了 TinyUSB 的 SOF 回调。不影响音频通路。
+7. `usb_device_uac.h` 的 `g_uac_spk_stream_on`、两个 `tud_audio_set_itf*_cb`：**告诉应用层流是开着还是关着**
+   （2026-11-26）。开流置真、关流 / 挂起 / 挂载时清零。应用层的发送任务据此在主机关流后
+   不再等满 30ms 才发补位包（`alink_tx.c` 的 `ALINK_TX_CLOSE_WAIT_US`）。
 
 组件的其余文件与上游逐字节一致。音量的范围、步进，以及 `set_volume_cb` 的 0~100 映射，
 都是上游原有实现，本项目没有改。
