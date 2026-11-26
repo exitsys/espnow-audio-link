@@ -623,6 +623,7 @@ static inline int32_t dither_tpdf(void)
  * TARGET_Q 调低之前先重算这个数。 */
 #define ALINK_Q_LOW          2
 #define ALINK_LOW_FADE_PKTS  3       /* 淡出用几块（每块 5ms），最后一块的增益正好到 0 */
+#define ALINK_LOW_ABORT      6       /* 淡出途中队列涨回 ALINK_Q_LOW + 这个数以上就中止（积压的包涌到了） */
 
 /* polyphase windowed-sinc 插值器参数。
  *
@@ -678,7 +679,8 @@ static int      s_clk_pending = 0;           /* 已接单、待切换的目标�
 static int      s_clk_fade    = 0;           /* >0 = 重配前还剩几包要淡出 */
 static int      s_low_fade    = 0;           /* >0 = 低水位淡出还剩几块要写（见 ALINK_Q_LOW） */
 static volatile bool s_low_done = false;     /* 淡出已经写完，播放任务该退回预缓冲了 */
-static volatile uint32_t s_low_rebuf = 0;    /* 低水位重缓冲的累计次数 */
+static volatile uint32_t s_low_rebuf = 0;    /* 低水位重缓冲的累计次数（淡出写完才算） */
+static volatile uint32_t s_low_abort = 0;    /* 淡出途中队列自己涨回来、中止的次数 */
 static uint32_t s_rate_frames = 0;           /* 测速窗口内累计到达帧数 */
 static int64_t  s_rate_t0     = 0;           /* 测速窗口起点 */
 static int      s_rate_prev   = 0;           /* 上一窗口测出的帧率，用于去抖 */
@@ -1841,7 +1843,7 @@ static void rx_task(void *arg)
                          ALINK_Q_LOW, (unsigned long)s_low_rebuf);
             }
 
-            ESP_LOGI(TAG, "包=%lu 丢=%lu(%.2f%%) 重复=%lu 补位=%lu 占位=%lu PLC=%lu 溢出=%lu 漂移丢=%lu 重采样=%+.2f%% I2S错=%lu 欠载=%lu 重缓冲=%lu 队列=%d(%d~%d) 输出=%.1f帧/秒 峰=%.1fdBFS RSSI=%d 跳变=%lu(边%lu/中%lu) 最大=%ld 零串=%lu帧(%lums) DMA余=%ld 相位钳=%lu 醒来=%lu",
+            ESP_LOGI(TAG, "包=%lu 丢=%lu(%.2f%%) 重复=%lu 补位=%lu 占位=%lu PLC=%lu 溢出=%lu 漂移丢=%lu 重采样=%+.2f%% I2S错=%lu 欠载=%lu 重缓冲=%lu 中止=%lu 队列=%d(%d~%d) 输出=%.1f帧/秒 峰=%.1fdBFS RSSI=%d 跳变=%lu(边%lu/中%lu) 最大=%ld 零串=%lu帧(%lums) DMA余=%ld 相位钳=%lu 醒来=%lu",
                          (unsigned long)got, (unsigned long)lost,
                          got ? lost * 100.0 / (got + lost) : 0.0,
                          (unsigned long)dup, (unsigned long)pad, (unsigned long)filled,
@@ -1850,7 +1852,8 @@ static void rx_task(void *arg)
                          (unsigned long)s_drift_drop,
                          (double)(s_src_ratio - 65536) * 100.0 / 65536.0,
                          (unsigned long)s_i2s_err,
-                         (unsigned long)s_underrun, (unsigned long)s_low_rebuf, q_depth(), s_q_min, s_q_max,
+                         (unsigned long)s_underrun, (unsigned long)s_low_rebuf, (unsigned long)s_low_abort,
+                         q_depth(), s_q_min, s_q_max,
                          out_rate, dbfs, rssi,
                          (unsigned long)(s_jump_edge + s_jump_mid),
                          (unsigned long)s_jump_edge, (unsigned long)s_jump_mid,
@@ -1962,16 +1965,27 @@ static void play_task(void *arg)
          * 队列只剩 ALINK_Q_LOW 包：不再一包包硬撑，按块淡出，写完最后一块就退回预缓冲。
          * 时钟重配自己有一段淡出，两段不叠在一起。
          * 这里不打日志：队列只剩 10ms，一条日志在串口上就要 10ms；由统计任务报（见 stats）。 */
+
+        /* 中止：淡出还没写完，队列自己又涨回来了 —— 收包路径卡了一下、积压的包一起涌到，
+         * 或者空口那头缓过来之后成批到达。这种情况本来就不用管，硬停 90ms 反而是凭空加一次停顿。
+         * 2026-11-26 上板遇到过一次：收包路径卡了约 80ms（TX 的发包和 ACK 都正常），
+         * 队列 16 → 2 → 20。中止之后用长淡入把刚压下去的电平拉回来。 */
+        if ((s_low_fade > 0 || s_low_done) && d >= ALINK_Q_LOW + ALINK_LOW_ABORT) {
+            s_low_fade = 0;
+            s_low_done = false;
+            s_low_abort++;
+            s_fade_in_left = ALINK_FADE_IN_FRAMES;
+        }
         if (s_low_fade == 0 && s_low_done == false &&
             s_clk_pending == 0 && s_clk_fade == 0 && d <= ALINK_Q_LOW) {
             s_low_fade = ALINK_LOW_FADE_PKTS;
-            s_low_rebuf++;
         }
         if (s_low_done) {
             s_low_done = false;
             started = false;
             starve   = 0;
             rebuf    = true;
+            s_low_rebuf++;           /* 淡出真的写完了才算一次 */
             continue;               /* 下一轮走上面的预缓冲分支：写静音，等水位 */
         }
 
