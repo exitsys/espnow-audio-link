@@ -170,6 +170,15 @@ static void led_all_off(void)
  * 流没关的时候的行为完全不变。 */
 #if ALINK_TX_USE_UAC
 #define ALINK_TX_CLOSE_WAIT_US  5000
+
+/* 一毫秒的标称字节数：48k × 2 声道 × 16bit。USB 级诊断用它把「少了多少」折成时间。 */
+#define ALINK_TX_USB_FRAME_BYTES 192
+
+/* 关流之后要不要追发（见 tx_task 发完之后的那段）。
+ * 2026-11-26 上板：同样两次关流，不追时 RX 队列 17 → 15、16 → 13；追了之后 17 → 17、16 → 16。 */
+#ifndef ALINK_TX_CLOSE_CATCHUP
+#define ALINK_TX_CLOSE_CATCHUP  1
+#endif
 #endif
 
 /* 主机音量 → 线性增益（Q16）。65536 = 0dB = 不改变。
@@ -208,13 +217,42 @@ static uint8_t s_peer[ESP_NOW_ETH_ALEN];
 static volatile uint32_t s_ack_ok, s_ack_fail;
 static volatile int64_t  s_ack_ok_us;      /* 最近一次收到 ACK 的时刻 */
 
+/* 空口延迟诊断（2026-11-26）：从 esp_now_send 入队，到收到发送回调（拿到 ACK，或放弃）的时间。
+ *
+ * 统计行里的「间隔」量的是入队时刻。帧在 WiFi 驱动里排队、在空口上退避重试的时间它看不见：
+ * 2026-11-26 两次录到接收端断流 80~100ms 然后成批涌到，而 TX 的入队间隔和 ACK 全部正常 ——
+ * 分不清是帧在空口上被挡了，还是接收端自己内部卡了。这个数在空口被挡时会跟着涨，
+ * 接收端内部卡的时候不会。
+ *
+ * 发送任务写、WiFi 任务读，各用各的下标；回调顺序和入队顺序一致（FIFO）。 */
+#define ALINK_TX_LAT_SLOTS 32
+static int64_t s_lat_call_us[ALINK_TX_LAT_SLOTS];
+static volatile uint32_t s_lat_head, s_lat_tail;
+static volatile int64_t  s_lat_max_us;        /* 本统计窗口内的最大值 */
+static volatile uint32_t s_lat_over20, s_lat_over50;   /* 本统计窗口内超过 20ms / 50ms 的帧数 */
+
 static void on_send(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
 {
+    const int64_t now = esp_timer_get_time();
     if (status == ESP_NOW_SEND_SUCCESS) {
         s_ack_ok++;
-        s_ack_ok_us = esp_timer_get_time();
+        s_ack_ok_us = now;
     } else {
         s_ack_fail++;
+    }
+    const uint32_t h = s_lat_head;
+    if ((int32_t)(s_lat_tail - h) > 0) {
+        const int64_t lat = now - s_lat_call_us[h % ALINK_TX_LAT_SLOTS];
+        s_lat_head = h + 1;
+        if (lat > s_lat_max_us) {
+            s_lat_max_us = lat;
+        }
+        if (lat > 20000) {
+            s_lat_over20++;
+            if (lat > 50000) {
+                s_lat_over50++;
+            }
+        }
     }
 }
 
@@ -434,6 +472,41 @@ static void usb_diag_report(void)
     prev_rx = rx; prev_zlp = zlp; prev_skip = skip; prev_late = late; prev_wait = wait;
     prev_short = shortp; prev_sbytes = sbytes; prev_open = open; prev_close = close;
 
+    /* 这个窗口一共少了多少字节：零长、缺帧各按一整毫秒（192 字节）算，短包按实际少掉的算。
+     *
+     * 少包只在「比平时多少了 5ms 以上」时才报。电视盒子送的是 47.93k，每秒比标称少 70 个样本，
+     * 短包（或者零长、缺帧，看它怎么发）每秒都有几十次 —— 那是盒子的常态，不是异常。
+     * 按每次都报的写法，接盒子时每 2 秒要多打两行日志，TX 任务在串口上被堵几十毫秒，
+     * 音频反而会被挤丢。「平时」取最近 8 个窗口的中位数；一次流的头 3 个窗口先不报少包。 */
+    const uint32_t miss = (dzlp + dskip) * ALINK_TX_USB_FRAME_BYTES + dsbyte;
+    static uint32_t miss_hist[8];
+    static int miss_n = 0, miss_i = 0;
+    uint32_t miss_med = 0;
+    if (begin) {
+        miss_n = miss_i = 0;         /* 新的一次流：重新学「平时」 */
+    } else {
+        if (miss_n >= 4) {
+            uint32_t sorted[8];
+            memcpy(sorted, miss_hist, sizeof(uint32_t) * (size_t)miss_n);
+            for (int i = 1; i < miss_n; i++) {       /* 最多 8 个数，插入排序足够 */
+                const uint32_t v = sorted[i];
+                int j = i;
+                while (j > 0 && sorted[j - 1] > v) {
+                    sorted[j] = sorted[j - 1];
+                    j--;
+                }
+                sorted[j] = v;
+            }
+            miss_med = (sorted[(miss_n - 1) / 2] + sorted[miss_n / 2]) / 2;
+        }
+        miss_hist[miss_i] = miss;
+        miss_i = (miss_i + 1) % 8;
+        if (miss_n < 8) {
+            miss_n++;
+        }
+    }
+    const bool miss_jump = (miss_n >= 4) && (miss > miss_med + 5 * ALINK_TX_USB_FRAME_BYTES);
+
     g_uac_diag.mark_log_us = esp_timer_get_time();
     if (begin) {
         ESP_LOGI(TAG, "USB 诊断：零长 %lu，短包 %lu（少 %lu 字节），缺帧 %lu，迟到 %lu（最长 %ld us），"
@@ -441,12 +514,14 @@ static void usb_diag_report(void)
                  (unsigned long)zlp, (unsigned long)shortp, (unsigned long)sbytes,
                  (unsigned long)skip, (unsigned long)late, (long)late_max, (long)rx_gap_max,
                  (unsigned long)open, (unsigned long)close);
-    } else if (dzlp || dskip || dlate || dwait || dshort) {
-        ESP_LOGW(TAG, "USB 异常：零长 +%lu，短包 +%lu（少 %lu 字节），缺帧 +%lu，迟到 +%lu，没取走 +%lu；"
-                      "开流 +%lu，关流 +%lu；零长 / 短包 / 缺帧发生时本机正在发包 %lu 次、"
-                      "正在打印 %lu 次（这两项是累计）；收包最大间隔 %ld us",
+    } else if (dlate || dwait || miss_jump) {
+        ESP_LOGW(TAG, "USB 异常：零长 +%lu，短包 +%lu（少 %lu 字节），缺帧 +%lu，本窗口共少 %lu 字节、平时 %lu；"
+                      "迟到 +%lu，没取走 +%lu；开流 +%lu，关流 +%lu；"
+                      "零长 / 短包 / 缺帧发生时本机正在发包 %lu 次、正在打印 %lu 次（这两项是累计）；"
+                      "收包最大间隔 %ld us",
                  (unsigned long)dzlp, (unsigned long)dshort, (unsigned long)dsbyte,
-                 (unsigned long)dskip, (unsigned long)dlate, (unsigned long)dwait,
+                 (unsigned long)dskip, (unsigned long)miss, (unsigned long)miss_med,
+                 (unsigned long)dlate, (unsigned long)dwait,
                  (unsigned long)dopen, (unsigned long)dclose,
                  (unsigned long)d->hit_rf_cnt, (unsigned long)d->hit_log_cnt, (long)rx_gap_max);
         char buf[160];
@@ -515,6 +590,9 @@ static void tx_task(void *arg)
          *
          * 所以 trigger 现在设成 1（见 app_main），只负责「有数据就唤醒」，
          * 攒够一包由这个循环负责，行为完全可预期。 */
+#if ALINK_TX_USE_UAC && ALINK_TX_CLOSE_CATCHUP
+        const bool was_starving = s_starving;   /* 这一拍开始时是不是断供态（见发完之后的「追发」） */
+#endif
         size_t total = 0;
         /* 等多久算「真断供」。
          *
@@ -723,8 +801,11 @@ static void tx_task(void *arg)
          * esp_now_send 只负责把包交给驱动入队，入队被拒几乎都是驱动队列满
          * （ESP_ERR_ESPNOW_NO_MEM，IDF 文档的原话是「过一会儿再发」）。它成串出现，
          * 说明空口或对端有一段时间收不过来，包成批压在驱动里、再成批到达。 */
+        s_lat_call_us[s_lat_tail % ALINK_TX_LAT_SLOTS] = esp_timer_get_time();
+        s_lat_tail++;
         const esp_err_t se = esp_now_send(s_peer, pkt, pkt_len);
         if (se != ESP_OK) {
+            s_lat_tail--;             /* 没入队就不会有回调，撤回这一条 */
             dropped++;
             send_err = se;
             if (dropped - drop_logged >= 100) {
@@ -739,6 +820,20 @@ static void tx_task(void *arg)
         int64_t now = esp_timer_get_time();
         last_send_us = now;
         int64_t gap = now - t_prev;
+#if ALINK_TX_USE_UAC && ALINK_TX_CLOSE_CATCHUP
+        /* 主机关流造成的半包：接着原来的 5ms 节拍发补位包，落后的格点照常补上。
+         *
+         * 不补的话，「关流 → 等完 ALINK_TX_CLOSE_WAIT_US → 半包发出」这段空档会一直留在
+         * 接收端的队列里：上一版上板量到每次关流掉 2~3 包，连着切歌几次还是见底。
+         * 补上之后这段空档由紧跟着的补位包填回来。节拍锚在上一包之后第 2 拍 ——
+         * 半包自己占第 1 拍，它晚发了多少，下一轮循环就按 ALINK_TX_CATCHUP_PKTS 的规矩追发。
+         *
+         * 只有「关流」造成的半包才补。流还开着、只是 30ms 等不到数据的那种半包不补：
+         * 那种情况数据多半只是晚了，随后会连着涌到，再补静音就是凭空插进去一段停顿。 */
+        if (s_starving && !was_starving && !g_uac_spk_stream_on) {
+            s_starve_grid = t_prev + 2 * ALINK_PKT_MS * 1000;
+        }
+#endif
         t_prev = now;
         if (gap_n) {
             if (gap < gap_min) gap_min = gap;
@@ -760,6 +855,11 @@ static void tx_task(void *arg)
                 ? (uint32_t)((uint64_t)aok * 10000 / (aok + afail)) : 0;
             uint32_t pps = (uint32_t)((int64_t)(sent - sent_at_log) * 1000000 / dt);
             uint32_t bps = (uint32_t)((int64_t)(s_uac_bytes - uac_at_log) * 1000000 / dt);
+            const int64_t lat_max = s_lat_max_us;
+            const uint32_t lat20 = s_lat_over20, lat50 = s_lat_over50;
+            s_lat_max_us = 0;
+            s_lat_over20 = 0;
+            s_lat_over50 = 0;
             t_log = now2;
             sent_at_log = sent;
             uac_at_log = s_uac_bytes;
@@ -767,7 +867,7 @@ static void tx_task(void *arg)
              * 全部改 %ld + (long) 强转；32 位平台上 int64 截断不影响这个量级。 */
 #if ALINK_TX_USE_UAC
             g_uac_diag.mark_log_us = esp_timer_get_time(); /* USB 诊断用：统计行本身可能阻塞串口 */
-            ESP_LOGI(TAG, "发=%lu(%lu/s) UAC=%lu B/s ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu UAC回调=%lu UAC丢=%lu 间隔 min/avg/max=%ld/%ld/%ld us 最近发送错误=%s",
+            ESP_LOGI(TAG, "发=%lu(%lu/s) UAC=%lu B/s ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu UAC回调=%lu UAC丢=%lu 间隔 min/avg/max=%ld/%ld/%ld us 空口延迟max=%ld us(>20ms %lu,>50ms %lu) 最近发送错误=%s",
                      (unsigned long)sent, (unsigned long)pps, (unsigned long)bps,
                      (unsigned long)aok, (unsigned long)(aok + afail),
                      (double)ack_pct_x100 / 100.0,
@@ -775,17 +875,17 @@ static void tx_task(void *arg)
                      (unsigned long)starve, (unsigned long)shortread,
                      (unsigned long)s_uac_cb, (unsigned long)s_uac_drop,
                      (long)gap_min, (long)(gap_n > 1 ? gap_sum / (int64_t)(gap_n - 1) : 0), (long)gap_max,
-                     esp_err_to_name(send_err));
+                     (long)lat_max, (unsigned long)lat20, (unsigned long)lat50, esp_err_to_name(send_err));
             g_uac_diag.mark_log_end_us = esp_timer_get_time();
 #else
-            ESP_LOGI(TAG, "发=%lu(%lu/s) ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu 间隔 min/avg/max=%ld/%ld/%ld us 最近发送错误=%s",
+            ESP_LOGI(TAG, "发=%lu(%lu/s) ACK=%lu/%lu(%.1f%%) 失败=%lu 欠载=%lu 半包=%lu 间隔 min/avg/max=%ld/%ld/%ld us 空口延迟max=%ld us(>20ms %lu,>50ms %lu) 最近发送错误=%s",
                      (unsigned long)sent, (unsigned long)pps,
                      (unsigned long)aok, (unsigned long)(aok + afail),
                      (double)ack_pct_x100 / 100.0,
                      (unsigned long)dropped,
                      (unsigned long)starve, (unsigned long)shortread,
                      (long)gap_min, (long)(gap_n > 1 ? gap_sum / (int64_t)(gap_n - 1) : 0), (long)gap_max,
-                     esp_err_to_name(send_err));
+                     (long)lat_max, (unsigned long)lat20, (unsigned long)lat50, esp_err_to_name(send_err));
 #endif
             gap_min = 1 << 30; gap_max = 0; gap_sum = 0; gap_n = 0;
 #if ALINK_TX_USE_UAC
