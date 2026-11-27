@@ -14,7 +14,8 @@ dependencies:
   #   # `public` flag doesn't have an effect dependencies of the `main` component.
   #   # All dependencies of `main` are public by default.
   #   public: true
-  ## 打补丁的本地副本（反馈值钉在标称速率、只读走 FIFO 半满线以上的数据、水位线按帧长对齐）。
+  ## 打补丁的本地副本（只读走 FIFO 半满线以上的数据、水位线按帧长对齐、
+  ## 数据端点改成 synchronous 且不带反馈端点）。
   ## 改动清单见根目录 NOTICE.md，文件内改动处都标了「本工程补丁」。
   ## 若要回退到上游原版：删掉下面 override_path 一行，重新构建时组件管理器会从
   ## 组件仓库下载 espressif/usb_device_uac（version "*" 取最新，不保证还是 1.3.2）。

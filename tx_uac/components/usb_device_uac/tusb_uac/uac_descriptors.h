@@ -105,8 +105,7 @@ enum {
     + TUD_AUDIO_DESC_CS_AS_INT_LEN\
     + TUD_AUDIO_DESC_TYPE_I_FORMAT_LEN\
     + TUD_AUDIO_DESC_STD_AS_ISO_EP_LEN\
-    + TUD_AUDIO_DESC_CS_AS_ISO_EP_LEN\
-    + TUD_AUDIO_DESC_STD_AS_ISO_FB_EP_LEN)
+    + TUD_AUDIO_DESC_CS_AS_ISO_EP_LEN)
 
 #define TUD_AUDIO_DESCRIPTOR(_itfnum, _stridx, _epout, _epin, _epfb)  TUD_AUDIO_MIC_SPEAK_DESCRIPTOR(_itfnum, _stridx, _epout, _epin, _epfb)
 
@@ -150,8 +149,7 @@ enum {
     + TUD_AUDIO_DESC_CS_AS_INT_LEN\
     + TUD_AUDIO_DESC_TYPE_I_FORMAT_LEN\
     + TUD_AUDIO_DESC_STD_AS_ISO_EP_LEN\
-    + TUD_AUDIO_DESC_CS_AS_ISO_EP_LEN\
-    + TUD_AUDIO_DESC_STD_AS_ISO_FB_EP_LEN)
+    + TUD_AUDIO_DESC_CS_AS_ISO_EP_LEN)
 
 #define TUD_AUDIO_DESCRIPTOR(_itfnum, _stridx, _epout, _epin, _epfb)  TUD_AUDIO_SPEAK_DESCRIPTOR(_itfnum, _stridx, _epout, _epfb)
 
@@ -187,17 +185,15 @@ enum {
     TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 1, /*_altset*/ 0x00, /*_nEPs*/ 0x00, /*_stridx*/ _stridx + 1),\
     /* Standard AS Interface Descriptor(4.9.1) */\
     /* Interface 1, Alternate 1 - alternate interface for data streaming */\
-    TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 1, /*_altset*/ 0x01, /*_nEPs*/ 0x02, /*_stridx*/ _stridx + 1),\
+    TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 1, /*_altset*/ 0x01, /*_nEPs*/ 0x01, /*_stridx*/ _stridx + 1),\
     /* Class-Specific AS Interface Descriptor(4.9.2) */\
     TUD_AUDIO_DESC_CS_AS_INT(/*_termid*/ UAC2_ENTITY_SPK_INPUT_TERMINAL, /*_ctrl*/ AUDIO_CTRL_NONE, /*_formattype*/ AUDIO_FORMAT_TYPE_I, /*_formats*/ AUDIO_DATA_FORMAT_TYPE_I_PCM, /*_nchannelsphysical*/ SPEAK_CHANNEL_NUM, /*_channelcfg*/ AUDIO_CHANNEL_CONFIG_NON_PREDEFINED, /*_stridx*/ 0x00),\
     /* Type I Format Type Descriptor(2.3.1.6 - Audio Formats) */\
     TUD_AUDIO_DESC_TYPE_I_FORMAT(CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_FORMAT_1_RESOLUTION_RX),\
     /* Standard AS Isochronous Audio Data Endpoint Descriptor(4.10.1.1) */\
-    TUD_AUDIO_DESC_STD_AS_ISO_EP(/*_ep*/ _epout, /*_attr*/ (TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_ASYNCHRONOUS | TUSB_ISO_EP_ATT_DATA), /*_maxEPsize*/ CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT, /*_interval*/ 1),\
+    TUD_AUDIO_DESC_STD_AS_ISO_EP(/*_ep*/ _epout, /*_attr*/ (TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_SYNCHRONOUS | TUSB_ISO_EP_ATT_DATA), /*_maxEPsize*/ CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT, /*_interval*/ 1),\
     /* Class-Specific AS Isochronous Audio Data Endpoint Descriptor(4.10.1.2) */\
-    TUD_AUDIO_DESC_CS_AS_ISO_EP(/*_attr*/ AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, /*_ctrl*/ AUDIO_CTRL_NONE, /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, /*_lockdelay*/ 0x0001),\
-    /* Standard AS Isochronous Audio Data Endpoint Descriptor(4.10.1.1) */\
-    TUD_AUDIO_DESC_STD_AS_ISO_FB_EP(/*_ep*/ _epfb, /*_epsize*/ 4, /*_interval*/1),\
+    TUD_AUDIO_DESC_CS_AS_ISO_EP(/*_attr*/ AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, /*_ctrl*/ AUDIO_CTRL_NONE, /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, /*_lockdelay*/ 0x0001)
     /* Standard AS Interface Descriptor(4.9.1) */\
     /* Interface 2, Alternate 0 - default alternate setting with 0 bandwidth */\
     TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 2, /*_altset*/ 0x00, /*_nEPs*/ 0x00, /*_stridx*/ _stridx + 2),\
@@ -254,6 +250,14 @@ enum {
  *
  */
 #if SPEAK_CHANNEL_NUM
+/* 【本工程补丁】扬声器的等时数据端点不带反馈端点，同步类型是 synchronous（2026-11-27）。
+ *
+ * 原版是「异步 + 显式反馈」。全速设备上反馈值的格式各家主机不一样：Windows 的 UAC2 驱动按 16.16 读，
+ * Linux 两种都认，macOS / iOS 只认 10.14（而且端点包长要标成 3）—— 同一套描述符没法两头通吃。
+ * 本工程的发射端没有自己的音频时钟，收到多少转发多少，实际上就是锁定在 USB 帧时钟上的设备，
+ * 上面的时钟源描述符本来也是这么声明的（attr = 3：内部时钟、与 SOF 同步）。
+ * 所以如实声明成 synchronous：主机直接按标称速率发（每帧正好 48 个样本），不需要反馈。
+ * _epfb 这个参数保留只是为了不改调用处，已经用不上。 */
 #define TUD_AUDIO_SPEAK_DESCRIPTOR(_itfnum, _stridx, _epout, _epfb) \
     /* Standard Interface Association Descriptor (IAD) */\
     TUD_AUDIO_DESC_IAD(/*_firstitfs*/ _itfnum, /*_nitfs*/ NUM_INTERFACES, /*_stridx*/ 0x00),\
@@ -273,17 +277,15 @@ enum {
     TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 1, /*_altset*/ 0x00, /*_nEPs*/ 0x00, /*_stridx*/ _stridx + 1),\
     /* Standard AS Interface Descriptor(4.9.1) */\
     /* Interface 1, Alternate 1 - alternate interface for data streaming */\
-    TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 1, /*_altset*/ 0x01, /*_nEPs*/ 0x02, /*_stridx*/ _stridx + 1),\
+    TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ _itfnum + 1, /*_altset*/ 0x01, /*_nEPs*/ 0x01, /*_stridx*/ _stridx + 1),\
     /* Class-Specific AS Interface Descriptor(4.9.2) */\
     TUD_AUDIO_DESC_CS_AS_INT(/*_termid*/ UAC2_ENTITY_SPK_INPUT_TERMINAL, /*_ctrl*/ AUDIO_CTRL_NONE, /*_formattype*/ AUDIO_FORMAT_TYPE_I, /*_formats*/ AUDIO_DATA_FORMAT_TYPE_I_PCM, /*_nchannelsphysical*/ SPEAK_CHANNEL_NUM, /*_channelcfg*/ AUDIO_CHANNEL_CONFIG_NON_PREDEFINED, /*_stridx*/ 0x00),\
     /* Type I Format Type Descriptor(2.3.1.6 - Audio Formats) */\
     TUD_AUDIO_DESC_TYPE_I_FORMAT(CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_FORMAT_1_RESOLUTION_RX),\
     /* Standard AS Isochronous Audio Data Endpoint Descriptor(4.10.1.1) */\
-    TUD_AUDIO_DESC_STD_AS_ISO_EP(/*_ep*/ _epout, /*_attr*/ (TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_ASYNCHRONOUS | TUSB_ISO_EP_ATT_DATA), /*_maxEPsize*/ CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT, /*_interval*/ 1),\
+    TUD_AUDIO_DESC_STD_AS_ISO_EP(/*_ep*/ _epout, /*_attr*/ (TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_SYNCHRONOUS | TUSB_ISO_EP_ATT_DATA), /*_maxEPsize*/ CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT, /*_interval*/ 1),\
     /* Class-Specific AS Isochronous Audio Data Endpoint Descriptor(4.10.1.2) */\
-    TUD_AUDIO_DESC_CS_AS_ISO_EP(/*_attr*/ AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, /*_ctrl*/ AUDIO_CTRL_NONE, /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, /*_lockdelay*/ 0x0001),\
-    /* Standard AS Isochronous Audio Data Endpoint Descriptor(4.10.1.1) */\
-    TUD_AUDIO_DESC_STD_AS_ISO_FB_EP(/*_ep*/ _epfb, /*_epsize*/ 4, /*_interval*/1)
+    TUD_AUDIO_DESC_CS_AS_ISO_EP(/*_attr*/ AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, /*_ctrl*/ AUDIO_CTRL_NONE, /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, /*_lockdelay*/ 0x0001)
 #endif
 
 #ifdef __cplusplus

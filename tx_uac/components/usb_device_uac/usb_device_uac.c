@@ -9,8 +9,9 @@
  * 文件内的改动处都标了「本工程补丁」。
  *
  *   1. tud_audio_set_itf_cb：去掉 USB 中断上下文里的 printf。
- *   2. tud_audio_rx_done_isr：反馈值固定为标称速率，不再交给 TinyUSB 的
- *      FIFO_COUNT 算法；只读走 FIFO 半满线以上的数据，水位线按帧长对齐。
+ *   2. tud_audio_rx_done_isr：只读走 FIFO 半满线以上的数据，水位线按帧长对齐。
+ *      （曾经这里还把反馈值固定成标称速率；2026-11-27 起描述符里不再有反馈端点，
+ *      见 uac_descriptors.h，这一段只在有反馈端点的配置下才编译。）
  *   3. tud_audio_rx_done_isr：上一块数据没被 usb_spk_task 取走时先不读，
  *      留在 FIFO 里等下一次（原版会覆盖，丢 1ms 音频）。
  *   4. usb_device_uac.h 的 uac_diag_t：每一包进来时记几个数，用来判断
@@ -265,6 +266,7 @@ static bool tud_audio_clock_set_request(uint8_t rhport, audio_control_request_t 
     }
 }
 
+#if CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
 void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedback_params_t* feedback_param)
 {
     (void)func_id;
@@ -275,6 +277,7 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedba
 
     ESP_LOGD(TAG, "Feedback method: %d, sample freq: %"PRIu32"", feedback_param->method, feedback_param->sample_freq);
 }
+#endif  /* CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP */
 
 // Helper for feature unit get requests
 static bool tud_audio_feature_unit_get_request(uint8_t rhport, audio_control_request_t const *request)
@@ -538,6 +541,10 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
     int bytes_remained = tud_audio_n_available(func_id);
     const size_t bytes_per_ms = s_uac_device->spk_bytes_per_ms;
 
+    /*! 【本工程补丁】下面这段「把反馈值钉在标称速率」现在用不上了：2026-11-27 起描述符里没有反馈端点，
+     *  数据端点声明成 synchronous，主机直接按标称速率发（见 uac_descriptors.h 里扬声器端点的说明）。
+     *  留着是为了万一有人把反馈端点加回来时有个依据：
+     */
     /*!< 【本工程补丁】反馈值直接钉在标称采样率，不交给 FIFO 水位算法。
      *
      *    TinyUSB 的 FIFO_COUNT 在这个盒子上会失稳：FIFO 一旦被填满，
@@ -548,6 +555,7 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
      *    主机对这个反馈值是认的（它确实跟着降到了 47k），所以直接把
      *    「48 样本/毫秒」写进去即可。两端晶振 ±50ppm 的长期差由 TX 侧
      *    40ms 的 StreamBuffer 和 RX 侧的水位闭环吸收，不需要 USB 侧精细调速。 */
+#if CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
     {
         const uint32_t frame_div = (tud_speed_get() == TUSB_SPEED_FULL) ? 1000 : 8000;
         /* 这里写的就是标称值本身，不要加预补偿。
@@ -561,6 +569,7 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
         const uint32_t spm = s_uac_device->current_sample_rate / frame_div;
         tud_audio_n_fb_set(func_id, spm << 16);
     }
+#endif
 
     /*!< 水位目标：让 FIFO 停在一半左右，只作为防溢出/防抽干的保护。
      *

@@ -8,16 +8,15 @@
  * 数据通路（2026-11-18 定稿）
  *
  *   盒子 USB ──1ms/包──► usb_device_uac ──output_cb──► StreamBuffer ──► tx_task ──► WiFi
- *                          异步+feedback                    8 包/40ms      攒够一包就发
+ *                          synchronous 端点              8 包/40ms      攒够一包就发
  *
  * 为什么是「数据驱动」而不是「固定节拍」：
  * UAC 的数据是主机的 USB 时钟推进来的，和 S3 的定时器不同源。按固定 5ms 发，
  * USB 侧缓冲必然缓慢堆积或抽干，而且这个漂移发生在 TX 侧，从接收端的日志里看不见。
  * 所以 tx_task 只做一件事：阻塞到 StreamBuffer 里攒够一整包，就发出去。
  *
- * usb_device_uac 用的是 ASYNCHRONOUS + feedback 端点（见组件
- * tusb_uac/uac_descriptors.h 的 TUSB_ISO_EP_ATT_ASYNCHRONOUS 和 FB_EP），
- * 但本工程的本地补丁把反馈值钉在了标称速率上（见组件 usb_device_uac.c）：
+ * usb_device_uac 的数据端点声明成 synchronous、没有反馈端点（2026-11-27 改的，原因见组件
+ * tusb_uac/uac_descriptors.h 里扬声器端点的说明；原版是「异步 + 显式反馈」）：
  * TX 只负责把主机送来的数据原样转发，不丢样本也不补样本，
  * 收发两端的时钟差全部交给接收端的水位闭环和 I2S 时钟跟随去消化。
  *
@@ -575,8 +574,9 @@ static void tx_task(void *arg)
     int64_t t_prev = esp_timer_get_time();
     int64_t gap_min = 1 << 30, gap_max = 0, gap_sum = 0;
     uint32_t gap_n = 0;
-    /* 速率自检：修完 UAC feedback 之后，这里应该是 ~200 包/秒、~192000 B/s。
-     * 如果 UAC 字节数明显高于 192000，说明反馈仍在把主机往 1.8 倍催。 */
+    /* 速率自检：这里应该是 ~200 包/秒、~192000 B/s。
+     * 如果 UAC 字节数明显高于 192000，说明主机在超量发送（以前反馈值不对时会把主机
+     * 往 1.8 倍催；现在没有反馈端点了，出现这种情况要查描述符）。 */
     int64_t t_log = esp_timer_get_time();
     uint32_t sent_at_log = 0, uac_at_log = 0;
 

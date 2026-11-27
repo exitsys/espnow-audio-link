@@ -20,7 +20,8 @@ extern "C" {
 //--------------------------------------------------------------------
 
 // Enable feedback EP
-#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP                             1
+// 【本工程补丁】关掉：描述符里已经没有反馈端点了（原因见 uac_descriptors.h 里扬声器端点的说明）。
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP                             0
 
 // Enable/disable conversion from 16.16 to 10.14 format on full-speed devices
 #if CONFIG_UAC_SUPPORT_MACOS
